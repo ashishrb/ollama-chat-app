@@ -714,8 +714,49 @@
         let documents = [];
         let isProcessing = false;
 
+        // Load available models from Ollama
+        async function loadAvailableModels() {
+            try {
+                const response = await fetch('/api/models');
+                if (response.ok) {
+                    const data = await response.json();
+                    updateModelSelector(data.models);
+                } else {
+                    console.error('Failed to load models');
+                }
+            } catch (error) {
+                console.error('Error loading models:', error);
+            }
+        }
+
+        function updateModelSelector(models) {
+            const modelSelect = document.getElementById('modelSelect');
+            
+            // Clear existing options
+            modelSelect.innerHTML = '';
+            
+            if (models.length === 0) {
+                modelSelect.innerHTML = '<option value="">No models available</option>';
+                return;
+            }
+            
+            // Add available models
+            models.forEach(model => {
+                const option = document.createElement('option');
+                option.value = model.name;
+                option.textContent = `${model.name} (${model.size_gb}GB)`;
+                modelSelect.appendChild(option);
+            });
+            
+            // Select first model by default
+            if (models.length > 0) {
+                modelSelect.value = models[0].name;
+            }
+        }
         // Initialize the app
+       // Initialize the app
         document.addEventListener('DOMContentLoaded', function() {
+            loadAvailableModels();  // Load real models first
             loadSessions();
             loadDocuments();
             loadRAGStats();

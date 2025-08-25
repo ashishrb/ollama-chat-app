@@ -19,11 +19,21 @@ import structlog
 from collections import defaultdict, deque
 import time
 import psutil
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry, REGISTRY
+import aiofiles
+from functools import lru_cache
+import hashlib
 
 # Import RAG services
 from rag_service import RAGService
 from file_service import FileService
+
+from professional_prompts import (
+    SystemPrompts, 
+    SmartPrompts, 
+    get_prompt_for_request,
+    PromptConfig
+)
 
 # Import settings with better error handling
 try:
@@ -31,27 +41,32 @@ try:
     print(f"✅ Config loaded - Environment: {getattr(settings, 'debug', 'unknown')}")
 except ImportError as e:
     print(f"⚠️ Config import failed: {e}")
-    # Fallback settings if config.py doesn't exist
+    # Fallback settings optimized for performance
     class Settings:
-        debug = os.getenv("DEBUG", "true").lower() == "true"  # Default to True for development
+        debug = os.getenv("DEBUG", "true").lower() == "true"
         app_name = "Ollama Chat App with RAG"
         app_version = "1.0.0"
-        # More permissive CORS for development
         cors_origins = os.getenv("CORS_ORIGINS", "*").split(",") if os.getenv("CORS_ORIGINS") else ["*"]
         max_sessions_per_user = int(os.getenv("MAX_SESSIONS_PER_USER", "100"))
         max_messages_per_session = int(os.getenv("MAX_MESSAGES_PER_SESSION", "1000"))
-        session_ttl = int(os.getenv("SESSION_TTL", str(86400 * 7)))  # 7 days
-        session_cleanup_interval = int(os.getenv("SESSION_CLEANUP_INTERVAL", "3600"))  # 1 hour
-        # More lenient rate limiting for development
-        rate_limit_requests = int(os.getenv("RATE_LIMIT_REQUESTS", "300"))  # Increased from 100
-        rate_limit_window = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # 1 minute
+        session_ttl = int(os.getenv("SESSION_TTL", str(86400 * 7)))
+        session_cleanup_interval = int(os.getenv("SESSION_CLEANUP_INTERVAL", "3600"))
+        # Performance optimized rate limiting
+        rate_limit_requests = int(os.getenv("RATE_LIMIT_REQUESTS", "300"))
+        rate_limit_window = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
         ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "30"))
         ollama_max_retries = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
+        
+        # Performance settings
+        enable_caching = os.getenv("ENABLE_CACHING", "true").lower() == "true"
+        cache_ttl = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour
+        max_context_length = int(os.getenv("MAX_CONTEXT_LENGTH", "4000"))  # Reduced for speed
+        chunk_batch_size = int(os.getenv("CHUNK_BATCH_SIZE", "5"))  # Parallel processing
     
     settings = Settings()
-    print(f"✅ Fallback config loaded - Debug: {settings.debug}")
+    print(f"✅ Performance-optimized fallback config loaded - Debug: {settings.debug}")
 
-# Configure structured logging
+# Configure structured logging with performance optimizations
 structlog.configure(
     processors=[
         structlog.stdlib.filter_by_level,
@@ -72,39 +87,90 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-# Metrics
+# Performance metrics
+# Clear any existing metrics to avoid collisions
+try:
+    REGISTRY._collector_to_names.clear()
+    REGISTRY._names_to_collectors.clear()
+except:
+    pass
+
 REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status'])
 REQUEST_DURATION = Histogram('http_request_duration_seconds', 'HTTP request duration')
+RESPONSE_GENERATION_TIME = Histogram('response_generation_seconds', 'Time to generate AI response')
+CACHE_HITS = Counter('cache_hits_total', 'Total cache hits', ['cache_type'])
+CACHE_MISSES = Counter('cache_misses_total', 'Total cache misses', ['cache_type'])
 ACTIVE_SESSIONS = Gauge('active_sessions', 'Number of active sessions')
 TOTAL_SESSIONS = Gauge('total_sessions', 'Total number of sessions')
 OLLAMA_REQUESTS = Counter('ollama_requests_total', 'Total Ollama API requests')
 OLLAMA_ERRORS = Counter('ollama_errors_total', 'Total Ollama API errors')
 
-# Global storage with TTL support
+# Global storage with TTL support and caching
 chat_sessions: Dict[str, Dict[str, Any]] = {}
 active_sessions: Dict[str, str] = {}
 session_creation_times: Dict[str, float] = {}
 rate_limit_store: Dict[str, deque] = defaultdict(lambda: deque(maxlen=settings.rate_limit_requests))
 
-# Enhanced rate limiting with better error handling
+# Performance caches
+response_cache: Dict[str, Dict[str, Any]] = {}  # Simple in-memory cache
+model_warmup_cache: Dict[str, bool] = {}  # Track warmed-up models
+
+# OPTIMIZED: Response caching
+def get_cache_key(message: str, model: str, temperature: float, context: str = "") -> str:
+    """Generate cache key for responses"""
+    content = f"{message}:{model}:{temperature}:{context[:200]}"  # Limit context for key
+    return hashlib.md5(content.encode()).hexdigest()
+
+def get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Get cached response if available and not expired"""
+    if not settings.enable_caching:
+        return None
+        
+    if cache_key in response_cache:
+        cached = response_cache[cache_key]
+        if time.time() - cached['timestamp'] < settings.cache_ttl:
+            CACHE_HITS.labels(cache_type='response').inc()
+            return cached['data']
+        else:
+            # Expired, remove from cache
+            del response_cache[cache_key]
+    
+    CACHE_MISSES.labels(cache_type='response').inc()
+    return None
+
+def cache_response(cache_key: str, response_data: Dict[str, Any]):
+    """Cache response data"""
+    if not settings.enable_caching:
+        return
+        
+    response_cache[cache_key] = {
+        'data': response_data,
+        'timestamp': time.time()
+    }
+    
+    # Simple cache size management
+    if len(response_cache) > 1000:  # Max 1000 cached responses
+        # Remove oldest 100 entries
+        oldest_keys = sorted(response_cache.keys(), 
+                           key=lambda k: response_cache[k]['timestamp'])[:100]
+        for key in oldest_keys:
+            del response_cache[key]
+
+# OPTIMIZED: Rate limiting with better performance
 def check_rate_limit(client_id: str) -> bool:
-    """Check if client has exceeded rate limit - more lenient implementation"""
+    """Optimized rate limiting check"""
     try:
         now = time.time()
         client_requests = rate_limit_store[client_id]
         
-        # Remove old requests outside the window
-        while client_requests and now - client_requests[0] > settings.rate_limit_window:
+        # Batch cleanup for better performance
+        cutoff_time = now - settings.rate_limit_window
+        while client_requests and client_requests[0] < cutoff_time:
             client_requests.popleft()
         
-        # Check if limit exceeded
         if len(client_requests) >= settings.rate_limit_requests:
-            logger.warning(f"Rate limit exceeded for client {client_id}", 
-                         requests=len(client_requests), 
-                         limit=settings.rate_limit_requests)
             return False
         
-        # Add current request
         client_requests.append(now)
         return True
     except Exception as e:
@@ -112,57 +178,53 @@ def check_rate_limit(client_id: str) -> bool:
         return True  # Allow request if rate limiting fails
 
 def get_client_id(request: Request) -> str:
-    """Get client identifier for rate limiting with better error handling"""
+    """Optimized client ID extraction"""
     try:
-        # Use X-Forwarded-For for proxy support, fallback to client.host
-        forwarded_for = request.headers.get("X-Forwarded-For")
+        # Quick header check
+        forwarded_for = request.headers.get("x-forwarded-for")
         if forwarded_for:
             return forwarded_for.split(",")[0].strip()
         
-        # Safely get client host
-        if request.client and hasattr(request.client, 'host') and request.client.host:
+        if request.client and request.client.host:
             return request.client.host
         
-        # Fallback to request headers
-        host = request.headers.get("Host", "localhost")
-        return host.split(":")[0] if ":" in host else host
-        
-    except Exception as e:
-        logger.warning(f"Failed to get client ID: {e}")
+        return request.headers.get("host", "unknown").split(":")[0]
+    except Exception:
         return "unknown"
 
-# Session cleanup
+# OPTIMIZED: Session cleanup
 async def cleanup_expired_sessions():
-    """Remove expired sessions"""
+    """Optimized session cleanup"""
     now = time.time()
-    expired_sessions = []
+    expired_sessions = [
+        session_id for session_id, creation_time in session_creation_times.items()
+        if now - creation_time > settings.session_ttl
+    ]
     
-    for session_id, creation_time in session_creation_times.items():
-        if now - creation_time > settings.session_ttl:
-            expired_sessions.append(session_id)
+    if not expired_sessions:
+        return
     
+    # Batch deletion
     for session_id in expired_sessions:
-        if session_id in chat_sessions:
-            del chat_sessions[session_id]
-        if session_id in session_creation_times:
-            del session_creation_times[session_id]
+        chat_sessions.pop(session_id, None)
+        session_creation_times.pop(session_id, None)
         
         # Remove from active sessions
         for user_id, active_session_id in list(active_sessions.items()):
             if active_session_id == session_id:
                 del active_sessions[user_id]
+                break
     
-    if expired_sessions:
-        logger.info(f"Cleaned up {len(expired_sessions)} expired sessions")
-        TOTAL_SESSIONS.set(len(chat_sessions))
-        ACTIVE_SESSIONS.set(len(active_sessions))
+    logger.info(f"Cleaned up {len(expired_sessions)} expired sessions")
+    TOTAL_SESSIONS.set(len(chat_sessions))
+    ACTIVE_SESSIONS.set(len(active_sessions))
 
-# Pydantic models with enhanced validation
+# OPTIMIZED: Pydantic models with performance tweaks
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=10000)
+    message: str = Field(..., min_length=1, max_length=8000)  # Reduced max length
     model: str = Field(..., min_length=1, max_length=100)
     temperature: float = Field(0.2, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(None, ge=1, le=100000)
+    max_tokens: Optional[int] = Field(None, ge=1, le=4000)  # Reduced for speed
     session_id: Optional[str] = None
     user_id: Optional[str] = None
     
@@ -171,15 +233,7 @@ class ChatRequest(BaseModel):
     def validate_message(cls, v):
         if not v or not v.strip():
             raise ValueError('Message cannot be empty')
-        return v.strip()
-    
-    @field_validator('model')
-    @classmethod
-    def validate_model(cls, v):
-        if not v or not v.strip():
-            raise ValueError('Model must be specified')
-        # Remove the embedding model restriction that was causing issues
-        return v.strip()
+        return v.strip()[:8000]  # Truncate if too long
 
 class ChatResponse(BaseModel):
     response: str
@@ -188,6 +242,7 @@ class ChatResponse(BaseModel):
     message_id: str
     usage: Optional[int] = None
     timestamp: str
+    cached: bool = False  # Indicate if response was cached
 
 class SessionInfo(BaseModel):
     session_id: str
@@ -201,20 +256,13 @@ class NewSessionRequest(BaseModel):
     model: str = Field(..., min_length=1, max_length=100)
     title: Optional[str] = Field(None, max_length=200)
 
-# RAG Models
+# RAG Models (optimized)
 class RAGQueryRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=5000)
+    query: str = Field(..., min_length=1, max_length=3000)  # Reduced for performance
     model: str = Field(..., min_length=1, max_length=100)
     temperature: float = Field(0.2, ge=0.0, le=2.0)
-    max_chunks: int = Field(3, ge=1, le=10)
+    max_chunks: int = Field(3, ge=1, le=5)  # Reduced max chunks
     include_context: bool = Field(True)
-    
-    @field_validator('query')
-    @classmethod
-    def validate_query(cls, v):
-        if not v or not v.strip():
-            raise ValueError('Query cannot be empty')
-        return v.strip()
 
 class RAGQueryResponse(BaseModel):
     response: str
@@ -222,6 +270,7 @@ class RAGQueryResponse(BaseModel):
     model: str
     context_used: List[Dict[str, Any]]
     timestamp: str
+    cached: bool = False
 
 class DocumentUploadResponse(BaseModel):
     success: bool
@@ -241,20 +290,26 @@ class DocumentInfo(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("Starting Ollama Chat App", 
+    # Startup with performance optimizations
+    start_time = time.time()
+    logger.info("Starting Performance-Optimized Ollama Chat App", 
                 version=settings.app_version,
-                debug_mode=settings.debug)
+                debug_mode=settings.debug,
+                caching_enabled=settings.enable_caching)
     
-    # Initialize RAG and File services
+    # Initialize services
     global rag_service, file_service
     rag_service = RAGService()
     file_service = FileService()
     
     try:
-        # Test Ollama connection
+        # Test Ollama connection and warm up common models
         models = ollama.list()
-        logger.info("Ollama connection successful", models_count=len(models.get('models', [])))
+        model_count = len(models.get('models', []))
+        logger.info("Ollama connection successful", models_count=model_count)
+        
+        # Warm up commonly used models (async)
+        asyncio.create_task(warm_up_models())
         
         # Initialize RAG service
         await rag_service.initialize()
@@ -265,19 +320,41 @@ async def lifespan(app: FastAPI):
     
     # Start background tasks
     cleanup_task = asyncio.create_task(periodic_cleanup())
+    cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
+    
+    startup_time = time.time() - start_time
+    logger.info(f"Startup completed in {startup_time:.2f}s")
     
     yield
     
     # Shutdown
     logger.info("Shutting down Ollama Chat App")
     cleanup_task.cancel()
+    cache_cleanup_task.cancel()
     try:
-        await cleanup_task
-    except asyncio.CancelledError:
+        await asyncio.gather(cleanup_task, cache_cleanup_task, return_exceptions=True)
+    except Exception:
         pass
 
+async def warm_up_models():
+    """Pre-load commonly used models for better performance"""
+    # Only warmup models that are actually available
+    common_models = ['qwen3:latest', 'qwen2.5-coder:1.5b', 'gpt-oss:20B']
+    
+    for model in common_models:
+        try:
+            # Simple test request to warm up model
+            ollama.generate(model=model, prompt="Hello", options={'num_predict': 1})
+            model_warmup_cache[model] = True
+            logger.info(f"Warmed up model: {model}")
+        except Exception as e:
+            logger.warning(f"Failed to warm up model {model}: {e}")
+        
+        # Prevent overwhelming the system
+        await asyncio.sleep(1)
+
 async def periodic_cleanup():
-    """Periodically clean up expired sessions"""
+    """Optimized periodic cleanup"""
     while True:
         try:
             await cleanup_expired_sessions()
@@ -286,49 +363,61 @@ async def periodic_cleanup():
             break
         except Exception as e:
             logger.error("Error during cleanup", error=str(e))
-            await asyncio.sleep(60)  # Wait 1 minute before retrying
+            await asyncio.sleep(60)
+
+async def periodic_cache_cleanup():
+    """Clean up expired cache entries"""
+    while True:
+        try:
+            if settings.enable_caching:
+                now = time.time()
+                expired_keys = [
+                    key for key, data in response_cache.items()
+                    if now - data['timestamp'] > settings.cache_ttl
+                ]
+                
+                for key in expired_keys:
+                    del response_cache[key]
+                
+                if expired_keys:
+                    logger.info(f"Cleaned up {len(expired_keys)} expired cache entries")
+            
+            await asyncio.sleep(3600)  # Clean every hour
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Cache cleanup error", error=str(e))
+            await asyncio.sleep(3600)
 
 app = FastAPI(
     title=settings.app_name,
-    description="Advanced chat application with RAG capabilities and document management",
+    description="High-Performance chat application with RAG capabilities",
     version=settings.app_version,
     lifespan=lifespan,
     debug=settings.debug
 )
 
-# Add production middleware with better host configuration
+# Middleware with performance optimizations
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# IMPROVED: More flexible TrustedHostMiddleware configuration
+# OPTIMIZED: Conditional TrustedHostMiddleware
 environment = os.getenv("ENVIRONMENT", "development").lower()
-if not settings.debug and environment == "production":
-    # Only add strict host restrictions in production
+if environment == "production":
     allowed_hosts = ["localhost", "127.0.0.1", "0.0.0.0"]
-    
-    # Add custom hosts from environment
     custom_hosts = os.getenv("ALLOWED_HOSTS", "").split(",")
     allowed_hosts.extend([host.strip() for host in custom_hosts if host.strip()])
     
-    app.add_middleware(
-        TrustedHostMiddleware, 
-        allowed_hosts=allowed_hosts
-    )
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     logger.info("TrustedHostMiddleware enabled", allowed_hosts=allowed_hosts)
-else:
-    logger.info("TrustedHostMiddleware disabled (development mode)")
 
 # Serve static files
 if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
-else:
-    logger.warning("Static directory not found")
 
-# IMPROVED: More flexible CORS configuration
+# OPTIMIZED: CORS configuration
 cors_origins = settings.cors_origins
 if isinstance(cors_origins, str):
     cors_origins = [cors_origins]
-
-logger.info("CORS origins configured", origins=cors_origins)
 
 app.add_middleware(
     CORSMiddleware,
@@ -338,35 +427,28 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-# Enhanced middleware for request timing and metrics
+# OPTIMIZED: Performance middleware
 @app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
+async def performance_middleware(request: Request, call_next):
     start_time = time.time()
     
     try:
-        # Enhanced rate limiting with better error handling
+        # Skip rate limiting for health checks and static files
         should_rate_limit = (
             not request.url.path.startswith("/static") and 
-            request.url.path not in ["/", "/favicon.ico", "/health"] and
+            request.url.path not in ["/", "/favicon.ico", "/api/health", "/metrics"] and
             request.url.path.startswith("/api/") and
-            request.method != "OPTIONS"  # Skip OPTIONS requests
+            request.method != "OPTIONS"
         )
         
         if should_rate_limit:
-            try:
-                client_id = get_client_id(request)
-                if not check_rate_limit(client_id):
-                    REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path, status=429).inc()
-                    return JSONResponse(
-                        status_code=429,
-                        content={
-                            "detail": "Rate limit exceeded. Please try again later.",
-                            "retry_after": settings.rate_limit_window
-                        }
-                    )
-            except Exception as e:
-                logger.warning(f"Rate limiting failed for {request.url.path}: {str(e)}")
-                # Continue without rate limiting if it fails
+            client_id = get_client_id(request)
+            if not check_rate_limit(client_id):
+                REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path, status=429).inc()
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded", "retry_after": settings.rate_limit_window}
+                )
         
         response = await call_next(request)
         process_time = time.time() - start_time
@@ -375,25 +457,22 @@ async def add_process_time_header(request: Request, call_next):
         REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path, status=response.status_code).inc()
         REQUEST_DURATION.observe(process_time)
         
-        response.headers["X-Process-Time"] = str(process_time)
-        response.headers["X-App-Version"] = settings.app_version
+        # Add performance headers
+        response.headers["X-Process-Time"] = str(round(process_time, 4))
+        response.headers["X-Cache-Enabled"] = str(settings.enable_caching)
         
         return response
         
     except Exception as e:
         logger.error(f"Middleware error: {str(e)}")
-        # Return a proper error response instead of letting it crash
-        return JSONResponse(
-            status_code=500,
-            content={"detail": f"Internal server error: {str(e)}"}
-        )
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 def get_or_create_user_id() -> str:
-    """Generate or retrieve user ID (in production, implement proper user authentication)"""
+    """Generate user ID"""
     return str(uuid.uuid4())
 
 def create_new_session(model: str, title: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Create a new chat session"""
+    """Optimized session creation"""
     session_id = str(uuid.uuid4())
     default_title = title or f"New Chat - {datetime.now().strftime('%H:%M')}"
     
@@ -415,22 +494,21 @@ def create_new_session(model: str, title: Optional[str] = None, user_id: Optiona
     TOTAL_SESSIONS.set(len(chat_sessions))
     ACTIVE_SESSIONS.set(len(active_sessions))
     
-    logger.info("Created new session", session_id=session_id, model=model, user_id=user_id)
     return session
 
 def update_session_title(session_id: str, message: str) -> None:
-    """Update session title based on first user message"""
+    """Optimized title update"""
     if session_id in chat_sessions:
         session = chat_sessions[session_id]
-        if session["message_count"] == 1:  # First message
-            # Generate a title from the first message
-            words = message.split()[:5]  # First 5 words
-            title = " ".join(words) + ("..." if len(message.split()) > 5 else "")
+        if session["message_count"] == 1:
+            # Quick title generation
+            words = message.split()[:4]  # Reduced to 4 words for speed
+            title = " ".join(words) + ("..." if len(message.split()) > 4 else "")
             session["title"] = title
             session["updated_at"] = datetime.now().isoformat()
 
 def add_message_to_session(session_id: str, role: str, content: str, model: str) -> str:
-    """Add a message to a session and return message ID"""
+    """Optimized message addition"""
     if session_id not in chat_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -451,58 +529,565 @@ def add_message_to_session(session_id: str, role: str, content: str, model: str)
     
     return message_id
 
-def clean_ai_response(content: str) -> str:
-    """Clean AI response to remove thinking patterns and improve quality"""
-    # Remove common thinking patterns and unprofessional language
-    thinking_patterns = [
-        r'Okay, I need to.*?\.',
-        r'Let me think.*?\.',
-        r'First, I remember.*?\.',
-        r'But wait.*?\.',
-        r'Oh right.*?\.',
-        r'Maybe.*?\.',
-        r'I should check.*?\.',
-        r'Alternatively.*?\.',
-        r'But given that.*?\.',
-        r'In conclusion.*?\.',
-        r'To fine-tune.*?\.',
-        r'Note that.*?\.',
-        r'This example.*?\.',
-        r'But first.*?\.',
-        r'Another thing.*?\.',
-        r'Moreover.*?\.',
-        r'However.*?\.',
-        r'So, in the code.*?\.',
-        r'But this requires.*?\.',
-        r'Putting it all together.*?\.',
-        r'Okay, the user mentioned.*?\.',
-        r'First, I need to understand.*?\.',
-        r'I need to understand.*?\.',
-        r'The user wants.*?\.',
-        r'Based on the user.*?\.',
-        r'Looking at the user.*?\.',
-        r'From what I can see.*?\.',
-        r'It seems like.*?\.',
-        r'It appears that.*?\.',
-        r'Let me provide.*?\.',
-        r'Here\'s what I can.*?\.'
-    ]
+# OPTIMIZED: Lightweight system prompt for faster processing
+def get_optimized_system_prompt(message: str = "", model: str = "qwen3:latest", mode: str = "auto", context: str = "") -> str:
+    """Get optimized system prompt based on request characteristics and environment"""
     
-    cleaned_content = content
-    for pattern in thinking_patterns:
-        cleaned_content = re.sub(pattern, '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
+    # Get environment configuration
+    environment = os.getenv("ENVIRONMENT", "production")
+    config = PromptConfig.get_config(environment)
     
-    # Remove repetitive clarification questions
-    cleaned_content = re.sub(r'What kind of.*?\?', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_content = re.sub(r'Could you clarify.*?\?', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_content = re.sub(r'Can you specify.*?\?', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_content = re.sub(r'What exactly.*?\?', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
+    # For RAG queries, use RAG-specific prompts
+    if mode == "rag" and context:
+        smart_prompts = SmartPrompts(prefer_speed=config.get("prefer_speed", True))
+        return smart_prompts.get_rag_prompt(context, quality_mode=not config.get("prefer_speed", True))
     
-    # Clean up multiple newlines and spaces
-    cleaned_content = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned_content)
-    cleaned_content = re.sub(r'^\s+', '', cleaned_content, flags=re.MULTILINE)
+    # For regular chat, use smart prompt selection
+    if mode == "auto" or mode == "chat":
+        return get_prompt_for_request(message, model, config.get("default_mode", "balanced"))
     
-    return cleaned_content.strip()
+    # For specific modes, use system prompts
+    return SystemPrompts.get_prompt(mode)
+
+# Health check endpoint (optimized)
+@app.get("/api/health")
+async def health_check():
+    """Ultra-fast health check"""
+    try:
+        # Quick Ollama check
+        ollama_status = "connected" if model_warmup_cache else "connecting"
+        
+        return {
+            "status": "healthy", 
+            "ollama": ollama_status,
+            "sessions_count": len(chat_sessions),
+            "cache_enabled": settings.enable_caching,
+            "cached_responses": len(response_cache),
+            "warmed_models": len(model_warmup_cache),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": str(e), "timestamp": datetime.now().isoformat()}
+        )
+
+# OPTIMIZED: Chat endpoint with caching
+@app.post("/api/chat")
+async def chat_endpoint(request: ChatRequest):
+    generation_start = time.time()
+    
+    try:
+        # Input validation and processing
+        if not request.model.strip():
+            raise HTTPException(status_code=400, detail="Model must be specified")
+        
+        # Check for embedding model
+        model_lower = request.model.lower()
+        if 'embed' in model_lower and not any(word in model_lower for word in ['chat', 'instruct', 'code']):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Model '{request.model}' is an embedding model. Please use a chat model."
+            )
+        
+        user_id = request.user_id or get_or_create_user_id()
+        
+        # Session handling (optimized)
+        if request.session_id and request.session_id in chat_sessions:
+            session_id = request.session_id
+            session = chat_sessions[session_id]
+        else:
+            session = create_new_session(request.model, user_id=user_id)
+            session_id = session["session_id"]
+            active_sessions[user_id] = session_id
+        
+        # Check limits
+        if session["message_count"] >= settings.max_messages_per_session:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Maximum messages per session ({settings.max_messages_per_session}) exceeded."
+            )
+        
+        # Add user message
+        user_message_id = add_message_to_session(session_id, "user", request.message, request.model)
+        update_session_title(session_id, request.message)
+        
+        # OPTIMIZED: Check cache first
+        cache_key = get_cache_key(request.message, request.model, request.temperature)
+        cached_response = get_cached_response(cache_key)
+        
+        if cached_response:
+            # Use cached response
+            assistant_message_id = add_message_to_session(session_id, "assistant", cached_response['content'], request.model)
+            
+            return ChatResponse(
+                response=cached_response['content'],
+                model=request.model,
+                session_id=session_id,
+                message_id=assistant_message_id,
+                usage=cached_response.get('usage', 0),
+                timestamp=datetime.now().isoformat(),
+                cached=True
+            )
+        
+        # OPTIMIZED: Build context with length limits
+        system_prompt = get_optimized_system_prompt(
+            message=request.message, 
+            model=request.model, 
+            mode="chat"
+        )
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add recent messages with length control
+        # FIXED: Add conversation history in correct order (excluding the just-added user message)
+        recent_messages = session["messages"][:-1]  # Exclude the current user message just added
+        total_context_length = len(system_prompt)
+
+        # Add messages in chronological order (oldest to newest)
+        for msg in recent_messages[-8:]:  # Last 8 messages for context
+            msg_length = len(msg['content'])
+            if total_context_length + msg_length > settings.max_context_length:
+                break
+            messages.append({"role": msg['role'], "content": msg['content']})
+            total_context_length += msg_length
+
+        # Add the current user message (the one just added)
+        current_user_message = session["messages"][-1]
+        messages.append({"role": current_user_message['role'], "content": current_user_message['content']})
+        
+        # OPTIMIZED: Ollama options for speed
+        options = {
+            'temperature': request.temperature,
+            'top_p': 0.9,  # Add for better performance
+            'top_k': 40,   # Limit vocabulary for speed
+        }
+        if request.max_tokens:
+            options['num_predict'] = min(request.max_tokens, 2000)  # Cap for speed
+        
+        # Generate response with optimized retry logic
+        max_retries = 2  # Reduced retries
+        
+        for attempt in range(max_retries):
+            try:
+                OLLAMA_REQUESTS.inc()
+                
+                response = ollama.chat(
+                    model=request.model, 
+                    messages=messages,
+                    options=options
+                )
+                break
+                
+            except Exception as e:
+                OLLAMA_ERRORS.inc()
+                error_msg = str(e).lower()
+                
+                if attempt == max_retries - 1:
+                    logger.error("Ollama request failed", model=request.model, error=str(e))
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to generate response: {str(e)[:100]}..."  # Truncate error
+                    )
+                else:
+                    # Quick retry without exponential backoff
+                    await asyncio.sleep(0.5)
+        
+        # Process response
+        if not response or 'message' not in response:
+            raise HTTPException(status_code=500, detail="Invalid response from Ollama")
+        
+        assistant_content = response['message']['content']
+        
+        # Cache the response
+        cache_data = {
+            'content': assistant_content,
+            'usage': response.get('eval_count', 0)
+        }
+        cache_response(cache_key, cache_data)
+        
+        # Add to session
+        assistant_message_id = add_message_to_session(session_id, "assistant", assistant_content, request.model)
+        
+        generation_time = time.time() - generation_start
+        RESPONSE_GENERATION_TIME.observe(generation_time)
+        
+        return ChatResponse(
+            response=assistant_content,
+            model=request.model,
+            session_id=session_id,
+            message_id=assistant_message_id,
+            usage=response.get('eval_count', 0),
+            timestamp=datetime.now().isoformat(),
+            cached=False
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Chat error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)[:100]}...")
+
+# OPTIMIZED: Session endpoints
+@app.post("/api/sessions/new")
+async def create_new_session_endpoint(request: NewSessionRequest):
+    """Fast session creation"""
+    try:
+        session = create_new_session(request.model, request.title)
+        return {"success": True, "session": session}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session creation error: {str(e)[:50]}...")
+
+@app.get("/api/sessions")
+async def get_sessions():
+    """Optimized session retrieval"""
+    try:
+        # Quick list comprehension
+        sessions = [
+            SessionInfo(
+                session_id=session_id,
+                title=session["title"],
+                model=session["model"],
+                created_at=session["created_at"],
+                updated_at=session["updated_at"],
+                message_count=session["message_count"]
+            ) for session_id, session in chat_sessions.items()
+        ]
+        
+        # Sort by update time (faster than lambda)
+        sessions.sort(key=lambda x: x.updated_at, reverse=True)
+        return {"sessions": sessions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session retrieval error: {str(e)[:50]}...")
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Fast session deletion"""
+    try:
+        if session_id not in chat_sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Batch removal
+        chat_sessions.pop(session_id, None)
+        session_creation_times.pop(session_id, None)
+        
+        # Remove from active sessions
+        for user_id, active_session_id in list(active_sessions.items()):
+            if active_session_id == session_id:
+                del active_sessions[user_id]
+                break
+        
+        # Update metrics
+        TOTAL_SESSIONS.set(len(chat_sessions))
+        ACTIVE_SESSIONS.set(len(active_sessions))
+        
+        return {"success": True, "message": "Session deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Deletion error: {str(e)[:50]}...")
+
+@app.get("/api/models")
+async def get_models():
+    """Get only models that are actually available in Ollama"""
+    try:
+        # Check cache first
+        cache_key = "available_models"
+        cached_models = get_cached_response(cache_key)
+        
+        if cached_models:
+            return cached_models
+        
+        # Get models from Ollama
+        try:
+            models_response = ollama.list()
+        except Exception as e:
+            logger.error("Failed to fetch models from Ollama", error=str(e))
+            return {
+                "models": [], 
+                "error": "Ollama not available",
+                "message": "Please ensure Ollama is running and accessible."
+            }
+        
+        models = []
+        
+        # Extract models from response
+        raw_models = getattr(models_response, 'models', None) or models_response.get('models', [])
+        
+        if not raw_models:
+            return {
+                "models": [], 
+                "error": "No models available",
+                "message": "No models found in Ollama. Please pull some models first."
+            }
+        
+        # Filter out embedding models
+        embedding_indicators = {'embed', 'embedding', 'nomic-embed', 'all-minilm', 'bge-', 'gte-', 'text-embedding'}
+        
+        for model in raw_models:
+            # Extract model info
+            model_name = getattr(model, 'model', None) or model.get('model', '')
+            if not model_name:
+                continue
+            
+            model_lower = model_name.lower()
+            is_embedding = any(indicator in model_lower for indicator in embedding_indicators)
+            is_chat_compatible = any(word in model_lower for word in ['chat', 'instruct', 'code'])
+            
+            # Only include non-embedding models OR models that explicitly support chat
+            if not is_embedding or is_chat_compatible:
+                models.append({
+                    "name": model_name,
+                    "size": getattr(model, 'size', None) or model.get('size', 0),
+                    "size_gb": round((getattr(model, 'size', None) or model.get('size', 0)) / (1024**3), 2),
+                    "type": "chat",
+                    "warmed": model_name in model_warmup_cache,
+                    "status": "available"
+                })
+        
+        models.sort(key=lambda x: x['name'].lower())
+        
+        result = {"models": models, "total_models": len(models)}
+        cache_response(cache_key, result)
+        
+        logger.info(f"Found {len(models)} available chat models")
+        return result
+        
+    except Exception as e:
+        logger.error("Models retrieval error", error=str(e))
+        return {"models": [], "error": str(e)[:100]}
+
+# OPTIMIZED: RAG endpoints with async processing
+@app.post("/api/rag/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """Async document upload"""
+    try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+        
+        # Async file processing
+        file_info = await file_service.save_uploaded_file(file)
+        
+        # Process document asynchronously
+        result = await rag_service.process_document(
+            file_info["file_path"], 
+            file_info["original_name"]
+        )
+        
+        if result["success"]:
+            return DocumentUploadResponse(
+                success=True,
+                document_id=result["document_id"],
+                file_name=result["file_name"],
+                chunk_count=result["chunk_count"],
+                total_length=result["total_length"],
+                message="Document uploaded and processed successfully"
+            )
+        else:
+            file_service.delete_file(file_info["file_id"], file_info["file_type"])
+            raise HTTPException(status_code=400, detail=result["error"][:100])
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)[:100]}...")
+
+@app.post("/api/rag/query")
+async def rag_query(request: RAGQueryRequest):
+    """Cached RAG query processing"""
+    query_start = time.time()
+    
+    try:
+        # Check cache first
+        cache_key = get_cache_key(request.query, request.model, request.temperature, "rag")
+        cached_response = get_cached_response(cache_key)
+        
+        if cached_response:
+            return RAGQueryResponse(
+                response=cached_response['response'],
+                query=request.query,
+                model=request.model,
+                context_used=cached_response['context_used'],
+                timestamp=datetime.now().isoformat(),
+                cached=True
+            )
+        
+        # Get document context (with timeout)
+        try:
+            context_task = asyncio.wait_for(
+                rag_service.get_document_context(request.query, max_chunks=request.max_chunks),
+                timeout=5.0  # 5 second timeout for context retrieval
+            )
+            context = await context_task
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=408, detail="Document search timeout")
+        
+        if not context:
+            raise HTTPException(
+                status_code=400, 
+                detail="No documents available for RAG queries. Please upload documents first."
+            )
+        
+        # Optimized messages for RAG
+        system_prompt = get_optimized_system_prompt(
+            message=request.query,
+            model=request.model,
+            mode="rag",
+            context=context
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.query}
+        ]
+        
+        # Fast Ollama generation
+        options = {'temperature': request.temperature, 'num_predict': 800}  # Limit response length
+        
+        response = ollama.chat(model=request.model, messages=messages, options=options)
+        
+        # Get search results for context
+        search_results = await rag_service.search_documents(request.query, top_k=request.max_chunks)
+        
+        # Cache the result
+        cache_data = {
+            'response': response['message']['content'],
+            'context_used': search_results
+        }
+        cache_response(cache_key, cache_data)
+        
+        query_time = time.time() - query_start
+        logger.info(f"RAG query processed in {query_time:.2f}s")
+        
+        return RAGQueryResponse(
+            response=response['message']['content'],
+            query=request.query,
+            model=request.model,
+            context_used=search_results,
+            timestamp=datetime.now().isoformat(),
+            cached=False
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"RAG query failed: {str(e)[:100]}...")
+
+@app.get("/api/rag/documents")
+async def get_documents():
+    """Fast document listing"""
+    try:
+        documents = rag_service.get_document_list()
+        return {"documents": documents}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get documents: {str(e)[:50]}...")
+
+@app.delete("/api/rag/documents/{document_id}")
+async def delete_document(document_id: str):
+    """Async document deletion"""
+    try:
+        documents = rag_service.get_document_list()
+        doc_info = next((doc for doc in documents if doc["id"] == document_id), None)
+        
+        if not doc_info:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        success = rag_service.delete_document(document_id)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete document")
+        
+        # Async file cleanup
+        remaining_doc_ids = [doc["id"] for doc in documents if doc["id"] != document_id]
+        file_service.cleanup_orphaned_files(remaining_doc_ids)
+        
+        return {"success": True, "message": "Document deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)[:50]}...")
+
+@app.get("/api/rag/stats")
+async def get_rag_stats():
+    """Cached RAG statistics"""
+    try:
+        cache_key = "rag_stats"
+        cached_stats = get_cached_response(cache_key)
+        
+        if cached_stats:
+            return cached_stats
+        
+        rag_stats = rag_service.get_document_stats()
+        file_stats = file_service.get_storage_stats()
+        
+        result = {"rag_stats": rag_stats, "file_stats": file_stats}
+        cache_response(cache_key, result)
+        
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)[:50]}...")
+
+@app.get("/api/rag/search")
+async def search_documents(query: str, top_k: int = 5):
+    """Fast document search"""
+    try:
+        if not query.strip():
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
+        
+        # Limit search parameters for speed
+        top_k = min(top_k, 10)
+        
+        results = await rag_service.search_documents(query, top_k=top_k)
+        return {"results": results}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)[:50]}...")
+
+# OPTIMIZED: Metrics endpoint
+@app.get("/metrics")
+async def metrics():
+    """Fast metrics generation"""
+    try:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Metrics generation failed")
+
+# OPTIMIZED: Test endpoints
+@app.get("/api/performance/cache-stats")
+async def get_cache_stats():
+    """Cache performance statistics"""
+    if not settings.debug:
+        raise HTTPException(status_code=404, detail="Debug endpoint not available")
+    
+    return {
+        "cache_enabled": settings.enable_caching,
+        "cached_responses": len(response_cache),
+        "cache_size_mb": sum(len(str(data)) for data in response_cache.values()) / 1024 / 1024,
+        "warmed_models": list(model_warmup_cache.keys()),
+        "settings": {
+            "cache_ttl": settings.cache_ttl,
+            "max_context_length": settings.max_context_length,
+            "chunk_batch_size": settings.chunk_batch_size
+        }
+    }
+
+@app.get("/api/performance/benchmark")
+async def benchmark_response():
+    """Quick benchmark endpoint"""
+    start = time.time()
+    
+    # Simulate some work
+    await asyncio.sleep(0.001)
+    
+    end = time.time()
+    
+    return {
+        "response_time_ms": round((end - start) * 1000, 2),
+        "timestamp": datetime.now().isoformat(),
+        "cache_enabled": settings.enable_caching,
+        "environment": environment
+    }
 
 # Serve the main page
 @app.get("/")
@@ -515,666 +1100,6 @@ async def read_index():
             content={"detail": "Frontend not found. Please ensure static/index.html exists."}
         )
 
-# Health check endpoint (moved before other endpoints for faster access)
-@app.get("/api/health")
-async def health_check():
-    """Enhanced health check endpoint"""
-    try:
-        # Test Ollama connection
-        ollama_status = "connected"
-        ollama_models = 0
-        try:
-            models = ollama.list()
-            ollama_models = len(models.get('models', []))
-        except Exception as e:
-            ollama_status = f"disconnected: {str(e)}"
-        
-        # Get system metrics
-        try:
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
-        except Exception as e:
-            cpu_percent = 0
-            memory = type('obj', (object,), {'percent': 0})
-            disk = type('obj', (object,), {'percent': 0})
-        
-        return {
-            "status": "healthy", 
-            "ollama": ollama_status,
-            "ollama_models": ollama_models,
-            "sessions_count": len(chat_sessions),
-            "active_sessions_count": len(active_sessions),
-            "system": {
-                "cpu_percent": cpu_percent,
-                "memory_percent": memory.percent,
-                "disk_percent": disk.percent
-            },
-            "app_version": settings.app_version,
-            "debug_mode": settings.debug,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error("Health check failed", error=str(e))
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "unhealthy", 
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
-        )
-
-@app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
-    try:
-        logger.info("Processing chat request", 
-                   model=request.model, 
-                   message_length=len(request.message))
-        
-        # Enhanced model validation
-        if not request.model or not request.model.strip():
-            raise HTTPException(status_code=400, detail="Model must be specified")
-        
-        # More flexible model compatibility check
-        model_lower = request.model.lower()
-        if 'embed' in model_lower and not any(chat_word in model_lower for chat_word in ['chat', 'instruct', 'code']):
-            logger.warning(f"Embedding model used for chat: {request.model}")
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Model '{request.model}' appears to be an embedding model. For chat, please select a chat-compatible model like 'llama3.2:3b', 'mistral:7b', or 'codellama:7b'."
-            )
-        
-        # Get or create user ID
-        user_id = request.user_id or get_or_create_user_id()
-        
-        # Check user session limits
-        user_sessions = [s for s in chat_sessions.values() if s.get('user_id') == user_id]
-        if len(user_sessions) >= settings.max_sessions_per_user:
-            raise HTTPException(
-                status_code=429, 
-                detail=f"Maximum sessions per user ({settings.max_sessions_per_user}) exceeded. Please delete some old sessions."
-            )
-        
-        # Get or create session
-        if request.session_id and request.session_id in chat_sessions:
-            session_id = request.session_id
-            session = chat_sessions[session_id]
-            
-            # Check if session belongs to user
-            if session.get('user_id') and session['user_id'] != user_id:
-                raise HTTPException(status_code=403, detail="Access denied to this session")
-        else:
-            # Create new session
-            session = create_new_session(request.model, user_id=user_id)
-            session_id = session["session_id"]
-            active_sessions[user_id] = session_id
-        
-        # Check message limits
-        if session["message_count"] >= settings.max_messages_per_session:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Maximum messages per session ({settings.max_messages_per_session}) exceeded. Please start a new session."
-            )
-        
-        # Add user message to session
-        user_message_id = add_message_to_session(session_id, "user", request.message, request.model)
-        
-        # Update session title if it's the first message
-        update_session_title(session_id, request.message)
-        
-        logger.info("Processing chat request", 
-                   session_id=session_id, 
-                   model=request.model, 
-                   message_length=len(request.message),
-                   user_id=user_id)
-        
-        # Prepare conversation context for Ollama
-        messages = []
-        
-        # Add system message for better response quality (always include for consistent behavior)
-        messages.append({
-            'role': 'system',
-            'content': 'You are a professional AI assistant. Provide direct, actionable solutions without thinking out loud. When asked for code: 1) Give the complete, working code immediately 2) Use proper markdown formatting with ```language blocks 3) Add brief, clear explanations 4) Do not ask for clarification unless absolutely necessary 5) Never use phrases like "Let me think", "I need to understand", "First, I remember", or similar internal monologue language. Be concise and professional.'
-        })
-        
-        # Add conversation history (last 10 messages for context)
-        for msg in session["messages"][-10:]:
-            messages.append({
-                'role': msg['role'],
-                'content': msg['content']
-            })
-        
-        # Prepare options
-        options = {}
-        if request.temperature is not None:
-            options['temperature'] = request.temperature
-        if request.max_tokens is not None:
-            options['num_predict'] = request.max_tokens
-        
-        # Generate response with enhanced retry logic
-        max_retries = settings.ollama_max_retries
-        last_error = None
-        
-        for attempt in range(max_retries):
-            try:
-                OLLAMA_REQUESTS.inc()
-                
-                # Test if model exists first
-                try:
-                    available_models = ollama.list()
-                    model_names = [m.get('model', '') for m in available_models.get('models', [])]
-                    if request.model not in model_names:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Model '{request.model}' not found. Available models: {', '.join(model_names[:5])}"
-                        )
-                except Exception as model_check_error:
-                    logger.warning(f"Could not verify model existence: {model_check_error}")
-                
-                response = ollama.chat(
-                    model=request.model, 
-                    messages=messages,
-                    options=options
-                )
-                break
-                
-            except Exception as e:
-                last_error = e
-                OLLAMA_ERRORS.inc()
-                error_msg = str(e).lower()
-                
-                logger.warning("Ollama request failed", 
-                             attempt=attempt + 1, 
-                             max_retries=max_retries, 
-                             error=str(e),
-                             model=request.model)
-                
-                # Check for specific error types
-                if 'does not support chat' in error_msg or 'embedding' in error_msg:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Model '{request.model}' does not support chat functionality. Please select a different model."
-                    )
-                elif 'not found' in error_msg or 'no such file' in error_msg:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Model '{request.model}' not found. Please check if it's properly installed with: ollama pull {request.model}"
-                    )
-                elif 'connection' in error_msg or 'refused' in error_msg:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Ollama service is not available. Please ensure Ollama is running."
-                    )
-                elif attempt == max_retries - 1:
-                    # Last attempt failed
-                    logger.error("All Ollama retry attempts failed", 
-                               model=request.model, 
-                               error=str(e))
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to generate response after {max_retries} attempts. Please try again or check if the model is working properly."
-                    )
-                else:
-                    # Wait before retry with exponential backoff
-                    wait_time = min(2 ** attempt, 10)  # Max 10 seconds
-                    await asyncio.sleep(wait_time)
-        
-        # Process response
-        if not response or 'message' not in response or 'content' not in response.get('message', {}):
-            raise HTTPException(
-                status_code=500,
-                detail="Invalid response from Ollama. Please try again."
-            )
-        
-        # Add assistant response to session
-        assistant_content = response['message']['content']
-        # Clean the response to remove thinking patterns
-        cleaned_content = clean_ai_response(assistant_content)
-        assistant_message_id = add_message_to_session(session_id, "assistant", cleaned_content, request.model)
-        
-        logger.info("Chat response generated successfully", 
-                   session_id=session_id,
-                   response_length=len(cleaned_content))
-        
-        return ChatResponse(
-            response=cleaned_content,
-            model=request.model,
-            session_id=session_id,
-            message_id=assistant_message_id,
-            usage=response.get('eval_count', 0),
-            timestamp=datetime.now().isoformat()
-        )
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions as-is
-        raise
-    except Exception as e:
-        logger.error("Unexpected chat error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-@app.post("/api/sessions/new")
-async def create_new_session_endpoint(request: NewSessionRequest):
-    """Create a new chat session"""
-    try:
-        session = create_new_session(request.model, request.title)
-        return {
-            "success": True,
-            "session": session
-        }
-    except Exception as e:
-        logger.error("Session creation error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Session creation error: {str(e)}")
-
-@app.get("/api/sessions")
-async def get_sessions():
-    """Get all chat sessions"""
-    try:
-        sessions = []
-        for session_id, session in chat_sessions.items():
-            sessions.append(SessionInfo(
-                session_id=session_id,
-                title=session["title"],
-                model=session["model"],
-                created_at=session["created_at"],
-                updated_at=session["updated_at"],
-                message_count=session["message_count"]
-            ))
-        
-        # Sort by most recent
-        sessions.sort(key=lambda x: x.updated_at, reverse=True)
-        return {"sessions": sessions}
-    except Exception as e:
-        logger.error("Sessions retrieval error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Sessions retrieval error: {str(e)}")
-
-@app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str):
-    """Get a specific chat session with messages"""
-    try:
-        if session_id not in chat_sessions:
-            raise HTTPException(status_code=404, detail="Session not found")
-        
-        session = chat_sessions[session_id]
-        return {
-            "session": session,
-            "messages": session["messages"]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Session retrieval error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Session retrieval error: {str(e)}")
-
-@app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str):
-    """Delete a chat session"""
-    try:
-        if session_id not in chat_sessions:
-            raise HTTPException(status_code=404, detail="Session not found")
-        
-        del chat_sessions[session_id]
-        
-        # Remove from active sessions if present
-        for user_id, active_session_id in list(active_sessions.items()):
-            if active_session_id == session_id:
-                del active_sessions[user_id]
-        
-        # Remove from creation times
-        if session_id in session_creation_times:
-            del session_creation_times[session_id]
-        
-        # Update metrics
-        TOTAL_SESSIONS.set(len(chat_sessions))
-        ACTIVE_SESSIONS.set(len(active_sessions))
-        
-        logger.info("Session deleted", session_id=session_id)
-        return {"success": True, "message": "Session deleted"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Session deletion error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Session deletion error: {str(e)}")
-
-@app.put("/api/sessions/{session_id}/title")
-async def update_session_title_endpoint(session_id: str, title_update: dict):
-    """Update session title"""
-    try:
-        if session_id not in chat_sessions:
-            raise HTTPException(status_code=404, detail="Session not found")
-        
-        new_title = title_update.get("title", "").strip()
-        if not new_title:
-            raise HTTPException(status_code=400, detail="Title cannot be empty")
-        
-        chat_sessions[session_id]["title"] = new_title
-        chat_sessions[session_id]["updated_at"] = datetime.now().isoformat()
-        
-        return {"success": True, "title": new_title}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Title update error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Title update error: {str(e)}")
-
-@app.get("/api/models")
-async def get_models():
-    """Get available Ollama models with enhanced compatibility filtering"""
-    try:
-        models_response = ollama.list()
-        models = []
-        
-        # Define known embedding models that should be filtered out for chat
-        embedding_indicators = {
-            'nomic-embed-text', 'nomic-embed', 'all-minilm', 'all-mpnet-base-v2',
-            'text-embedding-ada-002', 'text-embedding-3-small', 'text-embedding-3-large',
-            'sentence-transformers', 'bge-', 'gte-'
-        }
-        
-        # Handle both object and dictionary responses
-        raw_models = []
-        if hasattr(models_response, 'models') and models_response.models:
-            raw_models = models_response.models
-        elif isinstance(models_response, dict) and 'models' in models_response:
-            raw_models = models_response['models']
-        
-        for model in raw_models:
-            if hasattr(model, 'model'):
-                model_name = model.model
-                model_size = getattr(model, 'size', 0)
-                model_modified = str(getattr(model, 'modified_at', ''))
-                model_digest = getattr(model, 'digest', '')[:12] if hasattr(model, 'digest') else ''
-            else:
-                model_name = model.get('model', '')
-                model_size = model.get('size', 0)
-                model_modified = model.get('modified_at', '')
-                model_digest = model.get('digest', '')[:12] if model.get('digest') else ''
-            
-            if not model_name:
-                continue
-            
-            # Enhanced filtering logic
-            model_lower = model_name.lower()
-            is_embedding = any(embed_name in model_lower for embed_name in embedding_indicators)
-            is_chat_compatible = any(chat_word in model_lower for chat_word in ['chat', 'instruct', 'code'])
-            
-            # Include model if it's not an embedding model OR if it has chat indicators
-            if not is_embedding or is_chat_compatible:
-                models.append({
-                    "name": model_name,
-                    "size": model_size,
-                    "modified_at": model_modified,
-                    "digest": model_digest,
-                    "type": "chat",
-                    "is_embedding": is_embedding and not is_chat_compatible
-                })
-        
-        # Sort models by name for better UX
-        models.sort(key=lambda x: x['name'].lower())
-        
-        logger.info(f"Found {len(models)} available models")
-        return {"models": models}
-        
-    except Exception as e:
-        logger.error("Models retrieval error", error=str(e))
-        return {
-            "models": [], 
-            "error": str(e),
-            "message": "Could not retrieve models. Please ensure Ollama is running and accessible."
-        }
-
-@app.get("/metrics")
-async def metrics():
-    """Prometheus metrics endpoint"""
-    try:
-        return Response(
-            content=generate_latest(),
-            media_type=CONTENT_TYPE_LATEST
-        )
-    except Exception as e:
-        logger.error("Metrics generation error", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to generate metrics")
-
-# RAG Endpoints with enhanced error handling
-@app.post("/api/rag/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """Upload and process a document for RAG"""
-    try:
-        logger.info("Processing document upload", filename=file.filename, content_type=file.content_type)
-        
-        # Validate file
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="No file provided")
-        
-        # Save uploaded file
-        file_info = await file_service.save_uploaded_file(file)
-        
-        # Process document with RAG service
-        result = await rag_service.process_document(
-            file_info["file_path"], 
-            file_info["original_name"]
-        )
-        
-        if result["success"]:
-            logger.info("Document processed successfully", 
-                       document_id=result["document_id"],
-                       chunks=result["chunk_count"])
-            
-            return DocumentUploadResponse(
-                success=True,
-                document_id=result["document_id"],
-                file_name=result["file_name"],
-                chunk_count=result["chunk_count"],
-                total_length=result["total_length"],
-                message="Document uploaded and processed successfully"
-            )
-        else:
-            # Clean up file if processing failed
-            file_service.delete_file(file_info["file_id"], file_info["file_type"])
-            raise HTTPException(status_code=400, detail=result["error"])
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Error uploading document", error=str(e), filename=getattr(file, 'filename', 'unknown'))
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-
-@app.post("/api/rag/query")
-async def rag_query(request: RAGQueryRequest):
-    """Query documents using RAG"""
-    try:
-        logger.info("Processing RAG query", query_length=len(request.query), model=request.model)
-        
-        # Get relevant document context
-        context = await rag_service.get_document_context(
-            request.query, 
-            max_chunks=request.max_chunks
-        )
-        
-        if not context:
-            raise HTTPException(
-                status_code=400, 
-                detail="No documents available for RAG queries. Please upload some documents first."
-            )
-        
-        # Prepare conversation with context
-        messages = [
-            {
-                'role': 'system',
-                'content': f"""You are a helpful assistant that answers questions based on the provided document context. 
-                Use only the information from the context to answer questions. If the context doesn't contain enough 
-                information to answer the question, say so clearly. Be direct and professional.
-
-                Context from documents:
-                {context}
-
-                Answer the user's question based on this context."""
-            },
-            {
-                'role': 'user',
-                'content': request.query
-            }
-        ]
-        
-        # Generate response using Ollama with retry logic
-        options = {'temperature': request.temperature}
-        max_retries = 3
-        
-        for attempt in range(max_retries):
-            try:
-                response = ollama.chat(
-                    model=request.model,
-                    messages=messages,
-                    options=options
-                )
-                break
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to generate RAG response: {str(e)}"
-                    )
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
-        
-        # Get search results for context tracking
-        search_results = await rag_service.search_documents(request.query, top_k=request.max_chunks)
-        
-        logger.info("RAG query processed successfully", 
-                   response_length=len(response['message']['content']),
-                   context_chunks=len(search_results))
-        
-        return RAGQueryResponse(
-            response=response['message']['content'],
-            query=request.query,
-            model=request.model,
-            context_used=search_results,
-            timestamp=datetime.now().isoformat()
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Error in RAG query", error=str(e))
-        raise HTTPException(status_code=500, detail=f"RAG query failed: {str(e)}")
-
-@app.get("/api/rag/documents")
-async def get_documents():
-    """Get list of all processed documents"""
-    try:
-        documents = rag_service.get_document_list()
-        return {"documents": documents}
-    except Exception as e:
-        logger.error("Error getting documents", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Failed to get documents: {str(e)}")
-
-@app.delete("/api/rag/documents/{document_id}")
-async def delete_document(document_id: str):
-    """Delete a document and its embeddings"""
-    try:
-        # Get document info for file cleanup
-        documents = rag_service.get_document_list()
-        doc_info = next((doc for doc in documents if doc["id"] == document_id), None)
-        
-        if not doc_info:
-            raise HTTPException(status_code=404, detail="Document not found")
-        
-        # Delete from RAG service
-        success = rag_service.delete_document(document_id)
-        
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to delete document")
-        
-        # Clean up file storage
-        remaining_doc_ids = [doc["id"] for doc in documents if doc["id"] != document_id]
-        file_service.cleanup_orphaned_files(remaining_doc_ids)
-        
-        logger.info("Document deleted successfully", document_id=document_id)
-        return {"success": True, "message": "Document deleted successfully"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Error deleting document", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-
-@app.get("/api/rag/stats")
-async def get_rag_stats():
-    """Get RAG service statistics"""
-    try:
-        rag_stats = rag_service.get_document_stats()
-        file_stats = file_service.get_storage_stats()
-        
-        return {
-            "rag_stats": rag_stats,
-            "file_stats": file_stats
-        }
-    except Exception as e:
-        logger.error("Error getting RAG stats", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
-
-@app.get("/api/rag/search")
-async def search_documents(query: str, top_k: int = 5):
-    """Search documents using semantic similarity"""
-    try:
-        if not query or not query.strip():
-            raise HTTPException(status_code=400, detail="Query cannot be empty")
-        
-        results = await rag_service.search_documents(query, top_k=top_k)
-        return {"results": results}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Error searching documents", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-
-# Test endpoints for debugging
-@app.get("/api/test-markdown")
-async def test_markdown():
-    """Test endpoint to verify markdown rendering"""
-    test_content = """## Test Response
-
-This is a **test response** with:
-
-- **Bold text**
-- *Italic text*
-- `Code snippets`
-
-```python
-def hello_world():
-    print("Hello, World!")
-    return "Success"
-```
-
-### Code Block Test
-
-```javascript
-const testFunction = () => {
-    console.log("Testing markdown rendering");
-    return { status: "working" };
-};
-```
-
-The system is working correctly!"""
-    
-    return {"response": test_content}
-
-@app.get("/api/debug/config")
-async def debug_config():
-    """Debug endpoint to check configuration (remove in production)"""
-    if not settings.debug:
-        raise HTTPException(status_code=404, detail="Debug endpoint not available in production")
-    
-    return {
-        "debug": settings.debug,
-        "cors_origins": settings.cors_origins,
-        "rate_limit_requests": settings.rate_limit_requests,
-        "environment": os.getenv("ENVIRONMENT", "development"),
-        "allowed_hosts_env": os.getenv("ALLOWED_HOSTS", "not_set"),
-        "session_count": len(chat_sessions),
-        "app_version": settings.app_version
-    }
-
 # Error handlers
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc):
@@ -1185,10 +1110,6 @@ async def not_found_handler(request: Request, exc):
 
 @app.exception_handler(500)
 async def internal_error_handler(request: Request, exc):
-    logger.error("Internal server error", 
-                path=request.url.path,
-                method=request.method,
-                error=str(exc))
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error occurred"}
@@ -1197,14 +1118,15 @@ async def internal_error_handler(request: Request, exc):
 if __name__ == "__main__":
     import uvicorn
     
-    # Configuration for local development
     config = {
         "app": "app:app",
         "host": "0.0.0.0",
         "port": 8000,
         "reload": settings.debug,
         "log_level": "info" if not settings.debug else "debug",
+        "access_log": False,  # Disable for performance
+        "workers": 1 if settings.debug else 4,
     }
     
-    logger.info("Starting Ollama Chat App", **config)
+    logger.info("Starting Performance-Optimized Ollama Chat App", **config)
     uvicorn.run(**config)

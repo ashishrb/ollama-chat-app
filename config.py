@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     rag_chunk_overlap: int = 200
     rag_embedding_model: str = "nomic-embed-text:v1.5"
     
+    # Performance & Caching Configuration
+    enable_caching: bool = True
+    cache_ttl: int = 300  # 5 minutes
+    max_context_length: int = 4000  # Maximum context length for prompts
+    
     class Config:
         env_file = ".env"
         case_sensitive = False
