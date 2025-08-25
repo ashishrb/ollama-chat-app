@@ -1,0 +1,1174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ollama Chat App with RAG</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            background: #ffffff;
+            color: #374151;
+            line-height: 1.6;
+            overflow: hidden;
+        }
+
+        .app-container {
+            display: flex;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        /* Sidebar Styles */
+        .sidebar {
+            width: 350px;
+            background: #f9fafb;
+            border-right: 1px solid #e5e7eb;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid #e5e7eb;
+            background: #ffffff;
+        }
+
+        .new-chat-btn {
+            width: 100%;
+            padding: 12px 16px;
+            background: #10b981;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .new-chat-btn:hover {
+            background: #059669;
+        }
+
+        .new-chat-btn:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+
+        .sidebar-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+
+        .session-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .session-item {
+            padding: 12px 16px;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+        }
+
+        .session-item:hover {
+            border-color: #10b981;
+            background: #f0fdf4;
+        }
+
+        .session-item.active {
+            border-color: #10b981;
+            background: #f0fdf4;
+        }
+
+        .session-title {
+            font-weight: 500;
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .session-meta {
+            font-size: 12px;
+            color: #6b7280;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .delete-session-btn {
+            background: none;
+            border: none;
+            color: #ef4444;
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            font-size: 12px;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .session-item:hover .delete-session-btn {
+            opacity: 1;
+        }
+
+        .delete-session-btn:hover {
+            background: #fef2f2;
+        }
+
+        /* Main Content */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .chat-header {
+            padding: 20px;
+            border-bottom: 1px solid #e5e7eb;
+            background: #ffffff;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .chat-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #111827;
+        }
+
+        .model-selector {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .model-selector select {
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 14px;
+            background: #ffffff;
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .message {
+            display: flex;
+            gap: 12px;
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        .message.user {
+            flex-direction: row-reverse;
+        }
+
+        .message-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+
+        .message.user .message-avatar {
+            background: #10b981;
+            color: white;
+        }
+
+        .message.assistant .message-avatar {
+            background: #6366f1;
+            color: white;
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 12px 16px;
+            border-radius: 12px;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .message.user .message-content {
+            background: #10b981;
+            color: white;
+        }
+
+        .message.assistant .message-content {
+            background: #f3f4f6;
+            color: #374151;
+        }
+
+        .message-content pre {
+            background: #1f2937;
+            color: #f9fafb;
+            padding: 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+
+        .message-content code {
+            background: #f3f4f6;
+            padding: 2px 4px;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+        }
+
+        .message-content pre code {
+            background: none;
+            padding: 0;
+        }
+
+        .chat-input-container {
+            padding: 20px;
+            border-top: 1px solid #e5e7eb;
+            background: #ffffff;
+        }
+
+        .chat-input-wrapper {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+        }
+
+        .chat-input {
+            flex: 1;
+            min-height: 44px;
+            max-height: 120px;
+            padding: 12px 16px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 14px;
+            line-height: 1.5;
+            resize: vertical;
+            font-family: inherit;
+        }
+
+        .chat-input:focus {
+            outline: none;
+            border-color: #10b981;
+            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.1);
+        }
+
+        .send-btn {
+            padding: 12px 20px;
+            background: #10b981;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            white-space: nowrap;
+        }
+
+        .send-btn:hover {
+            background: #059669;
+        }
+
+        .send-btn:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+
+        /* RAG Panel */
+        .rag-panel {
+            width: 400px;
+            background: #f9fafb;
+            border-left: 1px solid #e5e7eb;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .rag-header {
+            padding: 20px;
+            border-bottom: 1px solid #e5e7eb;
+            background: #ffffff;
+        }
+
+        .rag-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #111827;
+            margin-bottom: 16px;
+        }
+
+        .rag-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        .rag-section {
+            margin-bottom: 24px;
+        }
+
+        .rag-section h3 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #374151;
+            margin-bottom: 12px;
+        }
+
+        .upload-area {
+            border: 2px dashed #d1d5db;
+            border-radius: 8px;
+            padding: 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s;
+            background: #ffffff;
+        }
+
+        .upload-area:hover {
+            border-color: #10b981;
+        }
+
+        .upload-area.dragover {
+            border-color: #10b981;
+            background: #f0fdf4;
+        }
+
+        .upload-icon {
+            font-size: 24px;
+            color: #6b7280;
+            margin-bottom: 8px;
+        }
+
+        .upload-text {
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        .document-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .document-item {
+            padding: 12px;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .document-info {
+            flex: 1;
+        }
+
+        .document-name {
+            font-weight: 500;
+            margin-bottom: 4px;
+            word-break: break-word;
+        }
+
+        .document-meta {
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        .delete-doc-btn {
+            background: none;
+            border: none;
+            color: #ef4444;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .delete-doc-btn:hover {
+            background: #fef2f2;
+        }
+
+        .rag-stats {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 16px;
+        }
+
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .stat-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .stat-label {
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        .stat-value {
+            font-weight: 500;
+            color: #374151;
+        }
+
+        /* Mode Selection */
+        .mode-selector {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        .mode-btn {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            background: #ffffff;
+            color: #374151;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .mode-btn.active {
+            background: #10b981;
+            color: white;
+            border-color: #10b981;
+        }
+
+        .mode-btn:hover:not(.active) {
+            background: #f3f4f6;
+        }
+
+        /* Loading States */
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f3f4f6;
+            border-radius: 50%;
+            border-top-color: #10b981;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Responsive Design */
+        @media (max-width: 1200px) {
+            .rag-panel {
+                width: 350px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .app-container {
+                flex-direction: column;
+            }
+            
+            .sidebar, .rag-panel {
+                width: 100%;
+                height: auto;
+            }
+            
+            .rag-panel {
+                border-left: none;
+                border-top: 1px solid #e5e7eb;
+            }
+        }
+
+        /* Error Messages */
+        .error-message {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            color: #dc2626;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+
+        .success-message {
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            color: #16a34a;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <button class="new-chat-btn" onclick="createNewSession()">
+                    <span>+</span>
+                    New Chat
+                </button>
+            </div>
+            <div class="sidebar-content">
+                <div class="session-list" id="sessionList">
+                    <!-- Sessions will be populated here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Chat Area -->
+        <div class="main-content">
+            <div class="chat-header">
+                <div class="chat-title" id="chatTitle">New Chat</div>
+                <div class="model-selector">
+                    <label for="modelSelect">Model:</label>
+                    <select id="modelSelect" onchange="changeModel()">
+                        <option value="llama3.2:3b">llama3.2:3b</option>
+                        <option value="llama3.2:8b">llama3.2:8b</option>
+                        <option value="llama3.2:70b">llama3.2:70b</option>
+                        <option value="gpt-oss:20B">gpt-oss:20B</option>
+                        <option value="mistral:7b">mistral:7b</option>
+                        <option value="codellama:7b">codellama:7b</option>
+                        <option value="nomic-embed-text:v1.5">nomic-embed-text:v1.5</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="chat-messages" id="chatMessages">
+                <div class="message assistant">
+                    <div class="message-avatar">AI</div>
+                    <div class="message-content">
+                        Hello! I'm your AI assistant. I can help you with:
+                        <br><br>
+                        • <strong>Chat Mode:</strong> General conversations and coding help
+                        • <strong>RAG Mode:</strong> Ask questions about uploaded documents
+                        • <strong>Search Mode:</strong> Find specific information in documents
+                        • <strong>Summarize Mode:</strong> Get document summaries
+                        <br><br>
+                        Upload some documents to get started with RAG functionality!
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-input-container">
+                <div class="chat-input-wrapper">
+                    <textarea 
+                        class="chat-input" 
+                        id="chatInput" 
+                        placeholder="Type your message here..."
+                        rows="1"
+                        onkeydown="handleKeyDown(event)"
+                    ></textarea>
+                    <button class="send-btn" onclick="sendMessage()" id="sendBtn">
+                        Send
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- RAG Panel -->
+        <div class="rag-panel">
+            <div class="rag-header">
+                <div class="rag-title">Document Management</div>
+                <div class="mode-selector">
+                    <button class="mode-btn active" data-mode="rag" onclick="setMode('rag')">
+                        <span>📄</span> RAG
+                    </button>
+                    <button class="mode-btn" data-mode="search" onclick="setMode('search')">
+                        <span>🔍</span> Search
+                    </button>
+                    <button class="mode-btn" data-mode="basic" onclick="setMode('basic')">
+                        <span>💬</span> Basic
+                    </button>
+                    <button class="mode-btn" data-mode="summarize" onclick="setMode('summarize')">
+                        <span>📝</span> Summarize
+                    </button>
+                </div>
+            </div>
+
+            <div class="rag-content">
+                <!-- RAG Mode -->
+                <div class="rag-section" id="ragSection">
+                    <h3>Upload File(s)</h3>
+                    <div class="upload-area" onclick="document.getElementById('fileInput').click()" 
+                         ondrop="handleDrop(event)" 
+                         ondragover="handleDragOver(event)" 
+                         ondragleave="handleDragLeave(event)">
+                        <div class="upload-icon">📁</div>
+                        <div class="upload-text">Click to upload or drag & drop</div>
+                        <div class="upload-text" style="font-size: 12px; margin-top: 4px;">
+                            Supports: PDF, DOCX, TXT, CSV, XLSX
+                        </div>
+                    </div>
+                    <input type="file" id="fileInput" class="file-input" multiple 
+                           accept=".pdf,.docx,.txt,.csv,.xlsx,.xls" onchange="handleFileSelect(event)">
+                    
+                    <div id="uploadStatus"></div>
+                </div>
+
+                <!-- Search Mode -->
+                <div class="rag-section" id="searchSection" style="display: none;">
+                    <h3>Search Documents</h3>
+                    <textarea 
+                        class="chat-input" 
+                        id="searchInput" 
+                        placeholder="Enter your search query..."
+                        rows="3"
+                        style="width: 100%; margin-bottom: 12px;"
+                    ></textarea>
+                    <button class="send-btn" onclick="searchDocuments()" style="width: 100%;">
+                        Search
+                    </button>
+                    <div id="searchResults" style="margin-top: 16px;"></div>
+                </div>
+
+                <!-- Basic Mode -->
+                <div class="rag-section" id="basicSection" style="display: none;">
+                    <h3>Basic Chat</h3>
+                    <div class="upload-text">
+                        Switch to Basic mode for general chat without document context.
+                    </div>
+                </div>
+
+                <!-- Summarize Mode -->
+                <div class="rag-section" id="summarizeSection" style="display: none;">
+                    <h3>Document Summarization</h3>
+                    <div class="upload-text">
+                        Upload documents and get AI-generated summaries.
+                    </div>
+                </div>
+
+                <!-- Document List -->
+                <div class="rag-section">
+                    <h3>Ingested Files</h3>
+                    <div class="document-list" id="documentList">
+                        <!-- Documents will be populated here -->
+                    </div>
+                </div>
+
+                <!-- Statistics -->
+                <div class="rag-section">
+                    <h3>Statistics</h3>
+                    <div class="rag-stats" id="ragStats">
+                        <!-- Stats will be populated here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let currentSessionId = null;
+        let currentMode = 'rag';
+        let documents = [];
+        let isProcessing = false;
+
+        // Initialize the app
+        document.addEventListener('DOMContentLoaded', function() {
+            loadSessions();
+            loadDocuments();
+            loadRAGStats();
+            setupEventListeners();
+        });
+
+        function setupEventListeners() {
+            // Auto-resize textarea
+            const chatInput = document.getElementById('chatInput');
+            chatInput.addEventListener('input', function() {
+                this.style.height = 'auto';
+                this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+            });
+
+            // File drag and drop
+            const uploadArea = document.querySelector('.upload-area');
+            uploadArea.addEventListener('dragover', handleDragOver);
+            uploadArea.addEventListener('drop', handleDrop);
+            uploadArea.addEventListener('dragleave', handleDragLeave);
+        }
+
+        // Mode Management
+        function setMode(mode) {
+            currentMode = mode;
+            
+            // Update active button
+            document.querySelectorAll('.mode-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.querySelector(`[data-mode="${mode}"]`).classList.add('active');
+            
+            // Show/hide sections
+            document.querySelectorAll('.rag-section').forEach(section => {
+                section.style.display = 'none';
+            });
+            
+            switch(mode) {
+                case 'rag':
+                    document.getElementById('ragSection').style.display = 'block';
+                    break;
+                case 'search':
+                    document.getElementById('searchSection').style.display = 'block';
+                    break;
+                case 'basic':
+                    document.getElementById('basicSection').style.display = 'block';
+                    break;
+                case 'summarize':
+                    document.getElementById('summarizeSection').style.display = 'block';
+                    break;
+            }
+            
+            // Update chat input placeholder
+            const chatInput = document.getElementById('chatInput');
+            switch(mode) {
+                case 'rag':
+                    chatInput.placeholder = "Ask questions about your uploaded documents...";
+                    break;
+                case 'search':
+                    chatInput.placeholder = "Search for specific information in documents...";
+                    break;
+                case 'basic':
+                    chatInput.placeholder = "Type your message here...";
+                    break;
+                case 'summarize':
+                    chatInput.placeholder = "Ask for document summaries...";
+                    break;
+            }
+        }
+
+        // File Upload Functions
+        function handleFileSelect(event) {
+            const files = event.target.files;
+            uploadFiles(files);
+        }
+
+        function handleDragOver(event) {
+            event.preventDefault();
+            event.currentTarget.classList.add('dragover');
+        }
+
+        function handleDragLeave(event) {
+            event.currentTarget.classList.remove('dragover');
+        }
+
+        function handleDrop(event) {
+            event.preventDefault();
+            event.currentTarget.classList.remove('dragover');
+            const files = event.dataTransfer.files;
+            uploadFiles(files);
+        }
+
+        async function uploadFiles(files) {
+            const uploadStatus = document.getElementById('uploadStatus');
+            uploadStatus.innerHTML = '<div class="loading"></div> Processing files...';
+            
+            for (let file of files) {
+                try {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    
+                    const response = await fetch('/api/rag/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (response.ok) {
+                        const result = await response.json();
+                        uploadStatus.innerHTML = `<div class="success-message">✅ ${file.name} uploaded successfully!</div>`;
+                        
+                        // Reload documents and stats
+                        await loadDocuments();
+                        await loadRAGStats();
+                        
+                        // Add success message to chat
+                        addMessage('assistant', `Document "${file.name}" has been uploaded and processed successfully! You can now ask questions about it.`);
+                    } else {
+                        const error = await response.json();
+                        uploadStatus.innerHTML = `<div class="error-message">❌ Failed to upload ${file.name}: ${error.detail}</div>`;
+                    }
+                } catch (error) {
+                    uploadStatus.innerHTML = `<div class="error-message">❌ Error uploading ${file.name}: ${error.message}</div>`;
+                }
+            }
+            
+            // Clear file input
+            document.getElementById('fileInput').value = '';
+        }
+
+        // Document Management
+        async function loadDocuments() {
+            try {
+                const response = await fetch('/api/rag/documents');
+                if (response.ok) {
+                    const data = await response.json();
+                    documents = data.documents;
+                    displayDocuments();
+                }
+            } catch (error) {
+                console.error('Error loading documents:', error);
+            }
+        }
+
+        function displayDocuments() {
+            const documentList = document.getElementById('documentList');
+            
+            if (documents.length === 0) {
+                documentList.innerHTML = '<div class="upload-text">No documents uploaded yet.</div>';
+                return;
+            }
+            
+            documentList.innerHTML = documents.map(doc => `
+                <div class="document-item">
+                    <div class="document-info">
+                        <div class="document-name">${doc.name}</div>
+                        <div class="document-meta">
+                            ${doc.extension} • ${doc.chunk_count} chunks • ${(doc.total_length / 1024).toFixed(1)} KB
+                        </div>
+                    </div>
+                    <button class="delete-doc-btn" onclick="deleteDocument('${doc.id}')">🗑️</button>
+                </div>
+            `).join('');
+        }
+
+        async function deleteDocument(documentId) {
+            if (!confirm('Are you sure you want to delete this document?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/rag/documents/${documentId}`, {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    await loadDocuments();
+                    await loadRAGStats();
+                    addMessage('assistant', 'Document deleted successfully.');
+                } else {
+                    const error = await response.json();
+                    alert(`Failed to delete document: ${error.detail}`);
+                }
+            } catch (error) {
+                console.error('Error deleting document:', error);
+                alert('Error deleting document');
+            }
+        }
+
+        async function loadRAGStats() {
+            try {
+                const response = await fetch('/api/rag/stats');
+                if (response.ok) {
+                    const data = await response.json();
+                    displayRAGStats(data);
+                }
+            } catch (error) {
+                console.error('Error loading RAG stats:', error);
+            }
+        }
+
+        function displayRAGStats(data) {
+            const ragStats = document.getElementById('ragStats');
+            const rag = data.rag_stats;
+            const files = data.file_stats;
+            
+            ragStats.innerHTML = `
+                <div class="stat-item">
+                    <span class="stat-label">Documents:</span>
+                    <span class="stat-value">${rag.total_documents}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Total Chunks:</span>
+                    <span class="stat-value">${rag.total_chunks}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Storage Used:</span>
+                    <span class="stat-value">${files.total_size_mb} MB</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Supported Formats:</span>
+                    <span class="stat-value">${rag.supported_formats.join(', ')}</span>
+                </div>
+            `;
+        }
+
+        // Search Functions
+        async function searchDocuments() {
+            const searchInput = document.getElementById('searchInput');
+            const query = searchInput.value.trim();
+            
+            if (!query) {
+                alert('Please enter a search query');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/rag/search?query=${encodeURIComponent(query)}&top_k=5`);
+                if (response.ok) {
+                    const data = await response.json();
+                    displaySearchResults(data.results);
+                } else {
+                    const error = await response.json();
+                    alert(`Search failed: ${error.detail}`);
+                }
+            } catch (error) {
+                console.error('Error searching documents:', error);
+                alert('Error searching documents');
+            }
+        }
+
+        function displaySearchResults(results) {
+            const searchResults = document.getElementById('searchResults');
+            
+            if (results.length === 0) {
+                searchResults.innerHTML = '<div class="upload-text">No relevant results found.</div>';
+                return;
+            }
+            
+            searchResults.innerHTML = results.map(result => `
+                <div class="document-item">
+                    <div class="document-info">
+                        <div class="document-name">${result.document_name}</div>
+                        <div class="document-meta">
+                            Similarity: ${(result.similarity_score * 100).toFixed(1)}% • Chunk ${result.chunk_index + 1}
+                        </div>
+                        <div class="document-meta" style="margin-top: 4px; font-style: italic;">
+                            ${result.chunk_text.substring(0, 150)}${result.chunk_text.length > 150 ? '...' : ''}
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Chat Functions
+        function createNewSession() {
+            currentSessionId = null;
+            document.getElementById('chatTitle').textContent = 'New Chat';
+            document.getElementById('chatMessages').innerHTML = `
+                <div class="message assistant">
+                    <div class="message-avatar">AI</div>
+                    <div class="message-content">
+                        Hello! I'm your AI assistant. How can I help you today?
+                    </div>
+                </div>
+            `;
+            document.getElementById('chatInput').value = '';
+        }
+
+        function changeModel() {
+            const modelSelect = document.getElementById('modelSelect');
+            const selectedModel = modelSelect.value;
+            console.log('Model changed to:', selectedModel);
+        }
+
+        function handleKeyDown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+
+        async function sendMessage() {
+            const chatInput = document.getElementById('chatInput');
+            const message = chatInput.value.trim();
+            
+            if (!message || isProcessing) return;
+            
+            const selectedModel = document.getElementById('modelSelect').value;
+            
+            // Add user message to chat
+            addMessage('user', message);
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+            
+            isProcessing = true;
+            document.getElementById('sendBtn').disabled = true;
+            
+            try {
+                let response;
+                
+                if (currentMode === 'rag' && documents.length > 0) {
+                    // RAG query
+                    response = await fetch('/api/rag/query', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            query: message,
+                            model: selectedModel,
+                            temperature: 0.2,
+                            max_chunks: 3,
+                            include_context: true
+                        })
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        addMessage('assistant', data.response);
+                    } else {
+                        const error = await response.json();
+                        addMessage('assistant', `Error: ${error.detail}`);
+                    }
+                } else {
+                    // Regular chat
+                    response = await fetch('/api/chat', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            message: message,
+                            model: selectedModel,
+                            temperature: 0.2
+                        })
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        addMessage('assistant', data.response);
+                        
+                        if (!currentSessionId) {
+                            currentSessionId = data.session_id;
+                            document.getElementById('chatTitle').textContent = 'Chat Session';
+                        }
+                    } else {
+                        const error = await response.json();
+                        addMessage('assistant', `Error: ${error.detail}`);
+                    }
+                }
+            } catch (error) {
+                console.error('Error sending message:', error);
+                addMessage('assistant', 'Sorry, I encountered an error. Please try again.');
+            } finally {
+                isProcessing = false;
+                document.getElementById('sendBtn').disabled = false;
+            }
+        }
+
+        function addMessage(role, content) {
+            const chatMessages = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            
+            // Format content (handle markdown-like formatting)
+            const formattedContent = formatMessageContent(content);
+            
+            messageDiv.innerHTML = `
+                <div class="message-avatar">${role === 'user' ? 'U' : 'AI'}</div>
+                <div class="message-content">${formattedContent}</div>
+            `;
+            
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function formatMessageContent(content) {
+            // Simple markdown-like formatting
+            return content
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+                .replace(/`([^`]+)`/g, '<code>$1</code>')
+                .replace(/\n/g, '<br>');
+        }
+
+        // Session Management
+        async function loadSessions() {
+            try {
+                const response = await fetch('/api/sessions');
+                if (response.ok) {
+                    const sessions = await response.json();
+                    displaySessions(sessions);
+                }
+            } catch (error) {
+                console.error('Error loading sessions:', error);
+            }
+        }
+
+        function displaySessions(sessions) {
+            const sessionList = document.getElementById('sessionList');
+            
+            if (sessions.length === 0) {
+                sessionList.innerHTML = '<div class="upload-text">No chat sessions yet.</div>';
+                return;
+            }
+            
+            sessionList.innerHTML = sessions.map(session => `
+                <div class="session-item" onclick="loadSession('${session.session_id}')">
+                    <div class="session-title">${session.title}</div>
+                    <div class="session-meta">
+                        <span>${session.model}</span>
+                        <button class="delete-session-btn" onclick="deleteSession('${session.session_id}', event)">
+                            🗑️
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function loadSession(sessionId) {
+            // Implementation for loading existing sessions
+            console.log('Loading session:', sessionId);
+        }
+
+        async function deleteSession(sessionId, event) {
+            event.stopPropagation();
+            if (!confirm('Are you sure you want to delete this session?')) {
+                return;
+            }
+            
+            // Implementation for deleting sessions
+            console.log('Deleting session:', sessionId);
+        }
+    </script>
+</body>
+</html>
