@@ -25,26 +25,31 @@ from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTEN
 from rag_service import RAGService
 from file_service import FileService
 
-# Import settings
+# Import settings with better error handling
 try:
     from config import settings
-except ImportError:
+    print(f"✅ Config loaded - Environment: {getattr(settings, 'debug', 'unknown')}")
+except ImportError as e:
+    print(f"⚠️ Config import failed: {e}")
     # Fallback settings if config.py doesn't exist
     class Settings:
-        debug = os.getenv("DEBUG", "false").lower() == "true"
+        debug = os.getenv("DEBUG", "true").lower() == "true"  # Default to True for development
         app_name = "Ollama Chat App with RAG"
         app_version = "1.0.0"
-        cors_origins = ["*"]
-        max_sessions_per_user = 100
-        max_messages_per_session = 1000
-        session_ttl = 86400 * 7
-        session_cleanup_interval = 3600
-        rate_limit_requests = 100
-        rate_limit_window = 60
-        ollama_timeout = 30
-        ollama_max_retries = 3
+        # More permissive CORS for development
+        cors_origins = os.getenv("CORS_ORIGINS", "*").split(",") if os.getenv("CORS_ORIGINS") else ["*"]
+        max_sessions_per_user = int(os.getenv("MAX_SESSIONS_PER_USER", "100"))
+        max_messages_per_session = int(os.getenv("MAX_MESSAGES_PER_SESSION", "1000"))
+        session_ttl = int(os.getenv("SESSION_TTL", str(86400 * 7)))  # 7 days
+        session_cleanup_interval = int(os.getenv("SESSION_CLEANUP_INTERVAL", "3600"))  # 1 hour
+        # More lenient rate limiting for development
+        rate_limit_requests = int(os.getenv("RATE_LIMIT_REQUESTS", "300"))  # Increased from 100
+        rate_limit_window = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # 1 minute
+        ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "30"))
+        ollama_max_retries = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
     
     settings = Settings()
+    print(f"✅ Fallback config loaded - Debug: {settings.debug}")
 
 # Configure structured logging
 structlog.configure(
@@ -79,28 +84,35 @@ OLLAMA_ERRORS = Counter('ollama_errors_total', 'Total Ollama API errors')
 chat_sessions: Dict[str, Dict[str, Any]] = {}
 active_sessions: Dict[str, str] = {}
 session_creation_times: Dict[str, float] = {}
-rate_limit_store: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+rate_limit_store: Dict[str, deque] = defaultdict(lambda: deque(maxlen=settings.rate_limit_requests))
 
-# Rate limiting
+# Enhanced rate limiting with better error handling
 def check_rate_limit(client_id: str) -> bool:
-    """Check if client has exceeded rate limit"""
-    now = time.time()
-    client_requests = rate_limit_store[client_id]
-    
-    # Remove old requests outside the window
-    while client_requests and now - client_requests[0] > settings.rate_limit_window:
-        client_requests.popleft()
-    
-    # Check if limit exceeded
-    if len(client_requests) >= settings.rate_limit_requests:
-        return False
-    
-    # Add current request
-    client_requests.append(now)
-    return True
+    """Check if client has exceeded rate limit - more lenient implementation"""
+    try:
+        now = time.time()
+        client_requests = rate_limit_store[client_id]
+        
+        # Remove old requests outside the window
+        while client_requests and now - client_requests[0] > settings.rate_limit_window:
+            client_requests.popleft()
+        
+        # Check if limit exceeded
+        if len(client_requests) >= settings.rate_limit_requests:
+            logger.warning(f"Rate limit exceeded for client {client_id}", 
+                         requests=len(client_requests), 
+                         limit=settings.rate_limit_requests)
+            return False
+        
+        # Add current request
+        client_requests.append(now)
+        return True
+    except Exception as e:
+        logger.error(f"Rate limiting error: {e}")
+        return True  # Allow request if rate limiting fails
 
 def get_client_id(request: Request) -> str:
-    """Get client identifier for rate limiting"""
+    """Get client identifier for rate limiting with better error handling"""
     try:
         # Use X-Forwarded-For for proxy support, fallback to client.host
         forwarded_for = request.headers.get("X-Forwarded-For")
@@ -108,14 +120,15 @@ def get_client_id(request: Request) -> str:
             return forwarded_for.split(",")[0].strip()
         
         # Safely get client host
-        if request.client and hasattr(request.client, 'host'):
+        if request.client and hasattr(request.client, 'host') and request.client.host:
             return request.client.host
         
         # Fallback to request headers
-        host = request.headers.get("Host", "unknown")
+        host = request.headers.get("Host", "localhost")
         return host.split(":")[0] if ":" in host else host
         
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to get client ID: {e}")
         return "unknown"
 
 # Session cleanup
@@ -144,7 +157,7 @@ async def cleanup_expired_sessions():
         TOTAL_SESSIONS.set(len(chat_sessions))
         ACTIVE_SESSIONS.set(len(active_sessions))
 
-# Pydantic models with validation
+# Pydantic models with enhanced validation
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=10000)
     model: str = Field(..., min_length=1, max_length=100)
@@ -156,8 +169,16 @@ class ChatRequest(BaseModel):
     @field_validator('message')
     @classmethod
     def validate_message(cls, v):
-        if not v.strip():
+        if not v or not v.strip():
             raise ValueError('Message cannot be empty')
+        return v.strip()
+    
+    @field_validator('model')
+    @classmethod
+    def validate_model(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Model must be specified')
+        # Remove the embedding model restriction that was causing issues
         return v.strip()
 
 class ChatResponse(BaseModel):
@@ -191,7 +212,7 @@ class RAGQueryRequest(BaseModel):
     @field_validator('query')
     @classmethod
     def validate_query(cls, v):
-        if not v.strip():
+        if not v or not v.strip():
             raise ValueError('Query cannot be empty')
         return v.strip()
 
@@ -221,7 +242,9 @@ class DocumentInfo(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Starting Ollama Chat App", version=settings.app_version)
+    logger.info("Starting Ollama Chat App", 
+                version=settings.app_version,
+                debug_mode=settings.debug)
     
     # Initialize RAG and File services
     global rag_service, file_service
@@ -230,14 +253,15 @@ async def lifespan(app: FastAPI):
     
     try:
         # Test Ollama connection
-        ollama.list()
-        logger.info("Ollama connection successful")
+        models = ollama.list()
+        logger.info("Ollama connection successful", models_count=len(models.get('models', [])))
         
         # Initialize RAG service
         await rag_service.initialize()
         logger.info("RAG service initialized successfully")
     except Exception as e:
         logger.error("Ollama connection failed", error=str(e))
+        logger.info("App will continue without Ollama - some features may not work")
     
     # Start background tasks
     cleanup_task = asyncio.create_task(periodic_cleanup())
@@ -266,50 +290,79 @@ async def periodic_cleanup():
 
 app = FastAPI(
     title=settings.app_name,
-    description="Advanced chat application with conversation management",
+    description="Advanced chat application with RAG capabilities and document management",
     version=settings.app_version,
     lifespan=lifespan,
     debug=settings.debug
 )
 
-# Add production middleware
+# Add production middleware with better host configuration
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-# Only add TrustedHostMiddleware in production, not in development
-if not settings.debug:
+
+# IMPROVED: More flexible TrustedHostMiddleware configuration
+environment = os.getenv("ENVIRONMENT", "development").lower()
+if not settings.debug and environment == "production":
+    # Only add strict host restrictions in production
+    allowed_hosts = ["localhost", "127.0.0.1", "0.0.0.0"]
+    
+    # Add custom hosts from environment
+    custom_hosts = os.getenv("ALLOWED_HOSTS", "").split(",")
+    allowed_hosts.extend([host.strip() for host in custom_hosts if host.strip()])
+    
     app.add_middleware(
         TrustedHostMiddleware, 
-        allowed_hosts=["localhost", "127.0.0.1", "localhost:8000", "127.0.0.1:8000", "0.0.0.0:8000", "yourdomain.com"]
+        allowed_hosts=allowed_hosts
     )
+    logger.info("TrustedHostMiddleware enabled", allowed_hosts=allowed_hosts)
+else:
+    logger.info("TrustedHostMiddleware disabled (development mode)")
 
 # Serve static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+else:
+    logger.warning("Static directory not found")
 
-# CORS for frontend communication
+# IMPROVED: More flexible CORS configuration
+cors_origins = settings.cors_origins
+if isinstance(cors_origins, str):
+    cors_origins = [cors_origins]
+
+logger.info("CORS origins configured", origins=cors_origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=cors_origins,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-# Middleware for request timing and metrics
+# Enhanced middleware for request timing and metrics
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
     
     try:
-        # Check rate limit (only for API endpoints, not static files or root)
-        if (not request.url.path.startswith("/static") and 
-            not request.url.path in ["/", "/favicon.ico"] and
-            request.url.path.startswith("/api/")):
+        # Enhanced rate limiting with better error handling
+        should_rate_limit = (
+            not request.url.path.startswith("/static") and 
+            request.url.path not in ["/", "/favicon.ico", "/health"] and
+            request.url.path.startswith("/api/") and
+            request.method != "OPTIONS"  # Skip OPTIONS requests
+        )
+        
+        if should_rate_limit:
             try:
                 client_id = get_client_id(request)
                 if not check_rate_limit(client_id):
                     REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path, status=429).inc()
                     return JSONResponse(
                         status_code=429,
-                        content={"detail": "Rate limit exceeded. Please try again later."}
+                        content={
+                            "detail": "Rate limit exceeded. Please try again later.",
+                            "retry_after": settings.rate_limit_window
+                        }
                     )
             except Exception as e:
                 logger.warning(f"Rate limiting failed for {request.url.path}: {str(e)}")
@@ -323,13 +376,17 @@ async def add_process_time_header(request: Request, call_next):
         REQUEST_DURATION.observe(process_time)
         
         response.headers["X-Process-Time"] = str(process_time)
+        response.headers["X-App-Version"] = settings.app_version
+        
         return response
         
     except Exception as e:
         logger.error(f"Middleware error: {str(e)}")
-        # Continue with request even if middleware fails
-        response = await call_next(request)
-        return response
+        # Return a proper error response instead of letting it crash
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal server error: {str(e)}"}
+        )
 
 def get_or_create_user_id() -> str:
     """Generate or retrieve user ID (in production, implement proper user authentication)"""
@@ -450,22 +507,82 @@ def clean_ai_response(content: str) -> str:
 # Serve the main page
 @app.get("/")
 async def read_index():
-    return FileResponse("static/index.html")
+    try:
+        return FileResponse("static/index.html")
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Frontend not found. Please ensure static/index.html exists."}
+        )
 
-# Favicon is handled by static files
+# Health check endpoint (moved before other endpoints for faster access)
+@app.get("/api/health")
+async def health_check():
+    """Enhanced health check endpoint"""
+    try:
+        # Test Ollama connection
+        ollama_status = "connected"
+        ollama_models = 0
+        try:
+            models = ollama.list()
+            ollama_models = len(models.get('models', []))
+        except Exception as e:
+            ollama_status = f"disconnected: {str(e)}"
+        
+        # Get system metrics
+        try:
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+        except Exception as e:
+            cpu_percent = 0
+            memory = type('obj', (object,), {'percent': 0})
+            disk = type('obj', (object,), {'percent': 0})
+        
+        return {
+            "status": "healthy", 
+            "ollama": ollama_status,
+            "ollama_models": ollama_models,
+            "sessions_count": len(chat_sessions),
+            "active_sessions_count": len(active_sessions),
+            "system": {
+                "cpu_percent": cpu_percent,
+                "memory_percent": memory.percent,
+                "disk_percent": disk.percent
+            },
+            "app_version": settings.app_version,
+            "debug_mode": settings.debug,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error("Health check failed", error=str(e))
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy", 
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+        )
 
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
     try:
-        # Validate model compatibility
-        if not request.model:
+        logger.info("Processing chat request", 
+                   model=request.model, 
+                   message_length=len(request.message))
+        
+        # Enhanced model validation
+        if not request.model or not request.model.strip():
             raise HTTPException(status_code=400, detail="Model must be specified")
         
-        # Check if model supports chat (basic validation)
-        if 'embed' in request.model.lower():
+        # More flexible model compatibility check
+        model_lower = request.model.lower()
+        if 'embed' in model_lower and not any(chat_word in model_lower for chat_word in ['chat', 'instruct', 'code']):
+            logger.warning(f"Embedding model used for chat: {request.model}")
             raise HTTPException(
                 status_code=400, 
-                detail=f"Model '{request.model}' is an embedding model and cannot be used for chat. Please select a chat-compatible model."
+                detail=f"Model '{request.model}' appears to be an embedding model. For chat, please select a chat-compatible model like 'llama3.2:3b', 'mistral:7b', or 'codellama:7b'."
             )
         
         # Get or create user ID
@@ -518,10 +635,11 @@ async def chat_endpoint(request: ChatRequest):
         # Add system message for better response quality (always include for consistent behavior)
         messages.append({
             'role': 'system',
-            'content': 'You are a professional coding assistant. Provide direct, actionable solutions without thinking out loud. When asked for code: 1) Give the complete, working code immediately 2) Use proper markdown formatting with ```language blocks 3) Add brief, clear explanations 4) Do not ask for clarification unless absolutely necessary 5) Never use phrases like "Let me think", "I need to understand", "First, I remember", or similar internal monologue language. Be concise and professional.'
+            'content': 'You are a professional AI assistant. Provide direct, actionable solutions without thinking out loud. When asked for code: 1) Give the complete, working code immediately 2) Use proper markdown formatting with ```language blocks 3) Add brief, clear explanations 4) Do not ask for clarification unless absolutely necessary 5) Never use phrases like "Let me think", "I need to understand", "First, I remember", or similar internal monologue language. Be concise and professional.'
         })
         
-        for msg in session["messages"][-10:]:  # Last 10 messages for context
+        # Add conversation history (last 10 messages for context)
+        for msg in session["messages"][-10:]:
             messages.append({
                 'role': msg['role'],
                 'content': msg['content']
@@ -534,19 +652,33 @@ async def chat_endpoint(request: ChatRequest):
         if request.max_tokens is not None:
             options['num_predict'] = request.max_tokens
         
-        # Generate response with retry logic and better error handling
+        # Generate response with enhanced retry logic
         max_retries = settings.ollama_max_retries
         last_error = None
         
         for attempt in range(max_retries):
             try:
                 OLLAMA_REQUESTS.inc()
+                
+                # Test if model exists first
+                try:
+                    available_models = ollama.list()
+                    model_names = [m.get('model', '') for m in available_models.get('models', [])]
+                    if request.model not in model_names:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Model '{request.model}' not found. Available models: {', '.join(model_names[:5])}"
+                        )
+                except Exception as model_check_error:
+                    logger.warning(f"Could not verify model existence: {model_check_error}")
+                
                 response = ollama.chat(
                     model=request.model, 
                     messages=messages,
                     options=options
                 )
                 break
+                
             except Exception as e:
                 last_error = e
                 OLLAMA_ERRORS.inc()
@@ -559,15 +691,20 @@ async def chat_endpoint(request: ChatRequest):
                              model=request.model)
                 
                 # Check for specific error types
-                if 'does not support chat' in error_msg or 'embed' in error_msg:
+                if 'does not support chat' in error_msg or 'embedding' in error_msg:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Model '{request.model}' is not compatible with chat. Please select a different model."
+                        detail=f"Model '{request.model}' does not support chat functionality. Please select a different model."
                     )
-                elif 'not found' in error_msg:
+                elif 'not found' in error_msg or 'no such file' in error_msg:
                     raise HTTPException(
                         status_code=404,
-                        detail=f"Model '{request.model}' not found. Please check if it's properly installed."
+                        detail=f"Model '{request.model}' not found. Please check if it's properly installed with: ollama pull {request.model}"
+                    )
+                elif 'connection' in error_msg or 'refused' in error_msg:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Ollama service is not available. Please ensure Ollama is running."
                     )
                 elif attempt == max_retries - 1:
                     # Last attempt failed
@@ -576,18 +713,29 @@ async def chat_endpoint(request: ChatRequest):
                                error=str(e))
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Failed to generate response after {max_retries} attempts. Error: {str(e)}"
+                        detail=f"Failed to generate response after {max_retries} attempts. Please try again or check if the model is working properly."
                     )
                 else:
                     # Wait before retry with exponential backoff
                     wait_time = min(2 ** attempt, 10)  # Max 10 seconds
                     await asyncio.sleep(wait_time)
         
+        # Process response
+        if not response or 'message' not in response or 'content' not in response.get('message', {}):
+            raise HTTPException(
+                status_code=500,
+                detail="Invalid response from Ollama. Please try again."
+            )
+        
         # Add assistant response to session
         assistant_content = response['message']['content']
         # Clean the response to remove thinking patterns
         cleaned_content = clean_ai_response(assistant_content)
         assistant_message_id = add_message_to_session(session_id, "assistant", cleaned_content, request.model)
+        
+        logger.info("Chat response generated successfully", 
+                   session_id=session_id,
+                   response_length=len(cleaned_content))
         
         return ChatResponse(
             response=cleaned_content,
@@ -602,8 +750,8 @@ async def chat_endpoint(request: ChatRequest):
         # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        print(f"Chat error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
+        logger.error("Unexpected chat error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @app.post("/api/sessions/new")
 async def create_new_session_endpoint(request: NewSessionRequest):
@@ -615,6 +763,7 @@ async def create_new_session_endpoint(request: NewSessionRequest):
             "session": session
         }
     except Exception as e:
+        logger.error("Session creation error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Session creation error: {str(e)}")
 
 @app.get("/api/sessions")
@@ -636,6 +785,7 @@ async def get_sessions():
         sessions.sort(key=lambda x: x.updated_at, reverse=True)
         return {"sessions": sessions}
     except Exception as e:
+        logger.error("Sessions retrieval error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Sessions retrieval error: {str(e)}")
 
 @app.get("/api/sessions/{session_id}")
@@ -650,7 +800,10 @@ async def get_session(session_id: str):
             "session": session,
             "messages": session["messages"]
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error("Session retrieval error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Session retrieval error: {str(e)}")
 
 @app.delete("/api/sessions/{session_id}")
@@ -667,8 +820,20 @@ async def delete_session(session_id: str):
             if active_session_id == session_id:
                 del active_sessions[user_id]
         
+        # Remove from creation times
+        if session_id in session_creation_times:
+            del session_creation_times[session_id]
+        
+        # Update metrics
+        TOTAL_SESSIONS.set(len(chat_sessions))
+        ACTIVE_SESSIONS.set(len(active_sessions))
+        
+        logger.info("Session deleted", session_id=session_id)
         return {"success": True, "message": "Session deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error("Session deletion error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Session deletion error: {str(e)}")
 
 @app.put("/api/sessions/{session_id}/title")
@@ -686,106 +851,101 @@ async def update_session_title_endpoint(session_id: str, title_update: dict):
         chat_sessions[session_id]["updated_at"] = datetime.now().isoformat()
         
         return {"success": True, "title": new_title}
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error("Title update error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Title update error: {str(e)}")
 
 @app.get("/api/models")
 async def get_models():
-    """Get available Ollama models with compatibility filtering"""
+    """Get available Ollama models with enhanced compatibility filtering"""
     try:
         models_response = ollama.list()
         models = []
         
-        # Define known embedding models that should be filtered out
-        embedding_models = {
+        # Define known embedding models that should be filtered out for chat
+        embedding_indicators = {
             'nomic-embed-text', 'nomic-embed', 'all-minilm', 'all-mpnet-base-v2',
-            'text-embedding-ada-002', 'text-embedding-3-small', 'text-embedding-3-large'
+            'text-embedding-ada-002', 'text-embedding-3-small', 'text-embedding-3-large',
+            'sentence-transformers', 'bge-', 'gte-'
         }
         
         # Handle both object and dictionary responses
+        raw_models = []
         if hasattr(models_response, 'models') and models_response.models:
-            for model in models_response.models:
-                model_name = getattr(model, 'model', '')
-                # Filter out embedding models and models with 'embed' in name
-                if (model_name and 
-                    not any(embed_name in model_name.lower() for embed_name in embedding_models) and
-                    'embed' not in model_name.lower()):
-                    models.append({
-                        "name": model_name,
-                        "size": getattr(model, 'size', 0),
-                        "modified_at": str(getattr(model, 'modified_at', '')),
-                        "digest": getattr(model, 'digest', '')[:12] if hasattr(model, 'digest') else '',
-                        "type": "chat"  # Mark as chat-compatible
-                    })
+            raw_models = models_response.models
         elif isinstance(models_response, dict) and 'models' in models_response:
-            for model in models_response['models']:
+            raw_models = models_response['models']
+        
+        for model in raw_models:
+            if hasattr(model, 'model'):
+                model_name = model.model
+                model_size = getattr(model, 'size', 0)
+                model_modified = str(getattr(model, 'modified_at', ''))
+                model_digest = getattr(model, 'digest', '')[:12] if hasattr(model, 'digest') else ''
+            else:
                 model_name = model.get('model', '')
-                # Filter out embedding models and models with 'embed' in name
-                if (model_name and 
-                    not any(embed_name in model_name.lower() for embed_name in embedding_models) and
-                    'embed' not in model_name.lower()):
-                    models.append({
-                        "name": model_name,
-                        "size": model.get('size', 0),
-                        "modified_at": model.get('modified_at', ''),
-                        "digest": model.get('digest', '')[:12] if model.get('digest') else '',
-                        "type": "chat"  # Mark as chat-compatible
-                    })
+                model_size = model.get('size', 0)
+                model_modified = model.get('modified_at', '')
+                model_digest = model.get('digest', '')[:12] if model.get('digest') else ''
+            
+            if not model_name:
+                continue
+            
+            # Enhanced filtering logic
+            model_lower = model_name.lower()
+            is_embedding = any(embed_name in model_lower for embed_name in embedding_indicators)
+            is_chat_compatible = any(chat_word in model_lower for chat_word in ['chat', 'instruct', 'code'])
+            
+            # Include model if it's not an embedding model OR if it has chat indicators
+            if not is_embedding or is_chat_compatible:
+                models.append({
+                    "name": model_name,
+                    "size": model_size,
+                    "modified_at": model_modified,
+                    "digest": model_digest,
+                    "type": "chat",
+                    "is_embedding": is_embedding and not is_chat_compatible
+                })
         
         # Sort models by name for better UX
         models.sort(key=lambda x: x['name'].lower())
         
+        logger.info(f"Found {len(models)} available models")
         return {"models": models}
         
     except Exception as e:
-        print(f"Models error: {str(e)}")
-        return {"models": [], "error": str(e)}
-
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint"""
-    try:
-        ollama.list()
-        
-        # Get system metrics
-        cpu_percent = psutil.cpu_percent(interval=1)
-        memory = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        
+        logger.error("Models retrieval error", error=str(e))
         return {
-            "status": "healthy", 
-            "ollama": "connected",
-            "sessions_count": len(chat_sessions),
-            "active_sessions_count": len(active_sessions),
-            "system": {
-                "cpu_percent": cpu_percent,
-                "memory_percent": memory.percent,
-                "disk_percent": disk.percent
-            },
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error("Health check failed", error=str(e))
-        return {
-            "status": "unhealthy", 
-            "ollama": "disconnected", 
+            "models": [], 
             "error": str(e),
-            "timestamp": datetime.now().isoformat()
+            "message": "Could not retrieve models. Please ensure Ollama is running and accessible."
         }
 
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint"""
-    return Response(
-        content=generate_latest(),
-        media_type=CONTENT_TYPE_LATEST
-    )
+    try:
+        return Response(
+            content=generate_latest(),
+            media_type=CONTENT_TYPE_LATEST
+        )
+    except Exception as e:
+        logger.error("Metrics generation error", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to generate metrics")
 
-# RAG Endpoints
+# RAG Endpoints with enhanced error handling
 @app.post("/api/rag/upload")
 async def upload_document(file: UploadFile = File(...)):
     """Upload and process a document for RAG"""
     try:
+        logger.info("Processing document upload", filename=file.filename, content_type=file.content_type)
+        
+        # Validate file
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+        
         # Save uploaded file
         file_info = await file_service.save_uploaded_file(file)
         
@@ -796,6 +956,10 @@ async def upload_document(file: UploadFile = File(...)):
         )
         
         if result["success"]:
+            logger.info("Document processed successfully", 
+                       document_id=result["document_id"],
+                       chunks=result["chunk_count"])
+            
             return DocumentUploadResponse(
                 success=True,
                 document_id=result["document_id"],
@@ -812,13 +976,15 @@ async def upload_document(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Error uploading document", error=str(e))
+        logger.error("Error uploading document", error=str(e), filename=getattr(file, 'filename', 'unknown'))
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.post("/api/rag/query")
 async def rag_query(request: RAGQueryRequest):
     """Query documents using RAG"""
     try:
+        logger.info("Processing RAG query", query_length=len(request.query), model=request.model)
+        
         # Get relevant document context
         context = await rag_service.get_document_context(
             request.query, 
@@ -837,8 +1003,9 @@ async def rag_query(request: RAGQueryRequest):
                 'role': 'system',
                 'content': f"""You are a helpful assistant that answers questions based on the provided document context. 
                 Use only the information from the context to answer questions. If the context doesn't contain enough 
-                information to answer the question, say so. Here is the relevant context:
+                information to answer the question, say so clearly. Be direct and professional.
 
+                Context from documents:
                 {context}
 
                 Answer the user's question based on this context."""
@@ -849,17 +1016,32 @@ async def rag_query(request: RAGQueryRequest):
             }
         ]
         
-        # Generate response using Ollama
+        # Generate response using Ollama with retry logic
         options = {'temperature': request.temperature}
+        max_retries = 3
         
-        response = ollama.chat(
-            model=request.model,
-            messages=messages,
-            options=options
-        )
+        for attempt in range(max_retries):
+            try:
+                response = ollama.chat(
+                    model=request.model,
+                    messages=messages,
+                    options=options
+                )
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to generate RAG response: {str(e)}"
+                    )
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
         
         # Get search results for context tracking
         search_results = await rag_service.search_documents(request.query, top_k=request.max_chunks)
+        
+        logger.info("RAG query processed successfully", 
+                   response_length=len(response['message']['content']),
+                   context_chunks=len(search_results))
         
         return RAGQueryResponse(
             response=response['message']['content'],
@@ -903,8 +1085,10 @@ async def delete_document(document_id: str):
             raise HTTPException(status_code=500, detail="Failed to delete document")
         
         # Clean up file storage
-        file_service.cleanup_orphaned_files([doc["id"] for doc in documents if doc["id"] != document_id])
+        remaining_doc_ids = [doc["id"] for doc in documents if doc["id"] != document_id]
+        file_service.cleanup_orphaned_files(remaining_doc_ids)
         
+        logger.info("Document deleted successfully", document_id=document_id)
         return {"success": True, "message": "Document deleted successfully"}
         
     except HTTPException:
@@ -932,7 +1116,7 @@ async def get_rag_stats():
 async def search_documents(query: str, top_k: int = 5):
     """Search documents using semantic similarity"""
     try:
-        if not query.strip():
+        if not query or not query.strip():
             raise HTTPException(status_code=400, detail="Query cannot be empty")
         
         results = await rag_service.search_documents(query, top_k=top_k)
@@ -944,153 +1128,83 @@ async def search_documents(query: str, top_k: int = 5):
         logger.error("Error searching documents", error=str(e))
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
+# Test endpoints for debugging
 @app.get("/api/test-markdown")
 async def test_markdown():
     """Test endpoint to verify markdown rendering"""
-    test_content = """## Delhi 2‑Night, 3‑Day Itinerary
+    test_content = """## Test Response
 
-Below is a **ready‑to‑go 2‑night Delhi itinerary** that balances the city's must‑see heritage sites, a taste of local cuisine, a little shopping, and a touch of modern culture. Feel free to tweak the timings or swap a few spots to match your interests or travel style.
+This is a **test response** with:
 
----
+- **Bold text**
+- *Italic text*
+- `Code snippets`
 
-## 1️⃣ Pre‑Trip Checklist
+```python
+def hello_world():
+    print("Hello, World!")
+    return "Success"
+```
 
-| Item | Why It Matters | Quick Tips |
-|------|----------------|------------|
-| **Passport & Visa** | Needed for all international arrivals | Keep a photocopy in your luggage and a digital copy in your phone. |
-| **Currency** | INR is the local currency | ATM cash is available everywhere. Card acceptance is widespread. |
-| **SIM Card** | Stay connected for maps, booking, and local rides | Buy a 5‑day data SIM at the airport (Aircel, Jio, or Airtel). |
-| **Weather** | Delhi can be hot (summer) or chilly (winter) | Pack a light jacket or sunglasses & sunscreen. |
-| **Health** | Hydration & food safety | Carry bottled water and basic meds (pain reliever, motion sickness). |
-| **Travel Insurance** | Covers medical & accidental events | Check that it includes COVID‑19 coverage if needed. |
+### Code Block Test
 
----
+```javascript
+const testFunction = () => {
+    console.log("Testing markdown rendering");
+    return { status: "working" };
+};
+```
 
-## 2️⃣ Arrival & Accommodation
-
-| Option | Approx. Cost (₹/night) | Highlights | Best For |
-|--------|------------------------|------------|----------|
-| **Luxury** – *The Imperial, New Delhi* | ₹15,000–₹20,000 | Classic colonial décor, 5‑star amenities, central location (Connaught Place). | Honeymooners, business travelers |
-| **Mid‑Range** – *JW Marriott Hotel, New Delhi* | ₹8,000–₹12,000 | Rooftop pool, great spa, easy metro access. | Couples, solo travelers |
-| **Budget** – *The Lodhi, New Delhi* | ₹3,000–₹5,000 | Boutique vibe, close to Old Delhi, free Wi‑Fi. | Backpackers, value‑seekers |
-| **Airbnb** – Private room in Connaught Place | ₹2,000–₹4,000 | Local vibe, often includes breakfast. | Solo travelers, groups |
-
-**Booking Tip** – Book via the hotel's own site or a reputable OTA (MakeMyTrip, Booking.com). Look for "free cancellation" if your schedule might change.
-
-**Transport from the Airport**
-- **Metro**: Airport Express Line (₹60) to New Delhi Station → transfer to Yellow Line to your hotel.
-- **Airport Taxi**: ₹400–₹600 (metered).
-- **Ride‑hailing**: Uber/Lyft – ₹350–₹500.
-- **Airport Shuttle**: Many hotels offer free or paid shuttles; check in advance.
-
----
-
-## 3️⃣ 2‑Night Itinerary (Sample)
-
-> **Assumptions** – Arrival on Day 1 afternoon, departure on Day 3 morning.
-> **Adjust** – If you arrive early or leave late, add a quick morning/afternoon visit.
-
-### Day 1 – Arrival & Evening Exploration
-
-| Time | Activity | Notes |
-|------|----------|-------|
-| **12:30 pm** | Check‑in & freshen up | Drop luggage at concierge. |
-| **1:30 pm** | Lunch at *Karim's* (Old Delhi) | Try *mutton seekh kebab* & *nawabi haleem*. |
-| **3:00 pm** | Walk to *Jama Masjid* & *Red Fort* | 30‑min walk; explore the bazaar on the way. |
-| **5:00 pm** | Ride to *India Gate* (via Metro – Yellow Line) | Sunset photo spot. |
-| **6:30 pm** | Dinner at *Bukhara* (ITC Maurya) | Reservations recommended; famous for *tandoori* dishes. |
-| **8:30 pm** | Night walk at *Connaught Place* (shopping & cafés) | Light stroll, grab a chai at *Café Zauq*. |
-
-**Optional** – If you're staying in Connaught Place, consider a *Rickshaw tour* of Old Delhi (₹200–₹300).
-
----
-
-### Day 2 – Full Day of Culture & Modernity
-
-| Time | Activity | Notes |
-|------|----------|-------|
-| **7:30 am** | Breakfast at hotel (or *The Indian Coffee House* for a local vibe). | |
-| **9:00 am** | Visit *Humayun's Tomb* (Metro – Yellow Line → *JNU*). | UNESCO heritage site. |
-| **10:30 am** | Walk to *Lotus Temple* (₹100 entry). | Meditation space; no photos inside. |
-| **12:00 pm** | Lunch at *Sukhi* (Punjabi restaurant) | Try *tandoori chicken* & *makki di roti*. |
-| **1:30 pm** | Explore *Qutub Minar* (Metro – Yellow Line → *Qutub Minar*). | 12‑m‑tall minaret; climb the 5th floor for a view. |
-| **3:00 pm** | Coffee break at *The Park Café* (Park Street, New Delhi). | |
-| **4:00 pm** | Visit *Akshardham Temple* (Metro – Violet Line → *Akshardham*). | Free entry; watch the evening light & sound show (8:30 pm). |
-| **6:30 pm** | Dinner at *Bengal Street* (street‑food stalls). | Try *kathi rolls*, *samosas*, *jalebi*. |
-| **8:00 pm** | Light evening stroll at *Raj Ghat* (Memorial to Mahatma Gandhi). | Quiet, reflective. |
-| **9:00 pm** | Return to hotel (Metro or cab). | |
-
-**Pro‑Tip** – Use the **Delhi Metro** app or Google Maps for real‑time updates; the network is reliable and covers most attractions.
-
----
-
-### Day 3 – Departure
-
-| Time | Activity | Notes |
-|------|----------|-------|
-| **6:30 am** | Breakfast at hotel / local café | |
-| **7:30 am** | Check‑out & collect luggage | |
-| **8:00 am** | Head to the airport | Use metro or pre‑book a taxi. |
-| **10:00 am** | Flight departure | |
-
----
-
-## 4️⃣ Dining Highlights (Beyond the Itinerary)
-
-| Dish | Where | Why |
-|------|-------|-----|
-| **Biryani** | *Baba Nandlal* (Old Delhi) | Classic Mughlai rice dish. |
-| **Chaat** | *Chaat Street* (Chandni Chowk) | Mix of tangy, sweet, and spicy. |
-| **Thali** | *Saravana Bhavan* (Connaught Place) | South‑Indian vegetarian feast. |
-| **Street‑Food** | *Khan Market* (Pav Bhaji, Momos) | Trendy, quick bites. |
-
----
-
-## 5️⃣ Budget Snapshot (₹ ≈ US$)
-
-| Category | Approx. Cost (₹) | Notes |
-|----------|------------------|-------|
-| **Accommodation (2 nights)** | 3,000–20,000 | Depends on class. |
-| **Meals** | 1,500–3,000 | 2–3 meals per day. |
-| **Transport (metro + taxis)** | 1,000–2,000 | |
-| **Entry Fees** | 500–1,000 | Red Fort, Qutub Minar, Akshardham. |
-| **Misc. (shopping, tips)** | 1,000–2,000 | |
-| **Total** | 7,000–28,000 | Roughly US$95–380 |
-
----
-
-## 6️⃣ Tips & Tricks
-
-| Topic | Advice |
-|-------|--------|
-| **Safety** | Keep valuables in a money belt. Avoid empty lanes at night. |
-| **Language** | English is widely spoken in hotels & metro. Learn a few Hindi phrases (e.g., *Namaste*, *Shukriya*). |
-| **Water** | Drink bottled water only. |
-| **Dress** | Modest clothing (especially near religious sites). |
-| **Connectivity** | Free Wi‑Fi in most hotels, but a local SIM gives you reliable data. |
-| **Cash vs. Card** | Many places accept cards; carry some cash for street vendors and small shops. |
-
----
-
-## 7️⃣ Quick FAQ
-
-| Question | Answer |
-|----------|--------|
-| **Is Delhi safe for solo travelers?** | Yes, but stay alert, especially at night. |
-| **What's the best way to get around?** | Delhi Metro is the most efficient; use ride‑hailing apps for short distances. |
-| **Can I visit all sites in 2 days?** | Yes, but you'll need to be early and efficient. |
-| **Do I need a visa?** | Yes, unless you're from a visa‑exempt country. Apply online (e‑visa) before departure. |
-
----
-
-### Final Thought
-
-Delhi is a city of contrasts: ancient monuments next to buzzing markets, quiet temples beside neon‑lit malls. With this 2‑night plan you'll hit the highlights, taste the flavors, and feel the pulse of India's capital. Have a fantastic trip! 🚀
-
-*Happy travels!*"""
+The system is working correctly!"""
     
     return {"response": test_content}
 
+@app.get("/api/debug/config")
+async def debug_config():
+    """Debug endpoint to check configuration (remove in production)"""
+    if not settings.debug:
+        raise HTTPException(status_code=404, detail="Debug endpoint not available in production")
+    
+    return {
+        "debug": settings.debug,
+        "cors_origins": settings.cors_origins,
+        "rate_limit_requests": settings.rate_limit_requests,
+        "environment": os.getenv("ENVIRONMENT", "development"),
+        "allowed_hosts_env": os.getenv("ALLOWED_HOSTS", "not_set"),
+        "session_count": len(chat_sessions),
+        "app_version": settings.app_version
+    }
+
+# Error handlers
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={"detail": f"Endpoint not found: {request.url.path}"}
+    )
+
+@app.exception_handler(500)
+async def internal_error_handler(request: Request, exc):
+    logger.error("Internal server error", 
+                path=request.url.path,
+                method=request.method,
+                error=str(exc))
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error occurred"}
+    )
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    # Configuration for local development
+    config = {
+        "app": "app:app",
+        "host": "0.0.0.0",
+        "port": 8000,
+        "reload": settings.debug,
+        "log_level": "info" if not settings.debug else "debug",
+    }
+    
+    logger.info("Starting Ollama Chat App", **config)
+    uvicorn.run(**config)
