@@ -3,7 +3,7 @@
 ## ✅ **COMPLETED: Production-Ready Features**
 
 ### 🔒 **Security & Rate Limiting**
-- ✅ **Rate Limiting**: Configurable per-endpoint rate limits (100 req/min for API, 5 req/min for chat)
+- ✅ **Rate Limiting**: Configurable global rate limit per client (300 req/min default)
 - ✅ **CORS Protection**: Environment-based CORS configuration
 - ✅ **Security Headers**: XSS protection, content type validation, frame options
 - ✅ **Input Validation**: Comprehensive Pydantic validation with length limits
@@ -59,7 +59,7 @@
 ### ✅ **After (Production Ready)**
 - Professional, direct AI responses
 - Clean markdown rendering with syntax highlighting
-- Comprehensive rate limiting and security
+- Comprehensive global rate limiting and security
 - TTL-based session management with cleanup
 - Full monitoring and observability
 - Robust error handling and logging
@@ -101,7 +101,7 @@ gunicorn --bind 0.0.0.0:8000 --workers 4 --worker-class uvicorn.workers.UvicornW
 
 ### **Scalability**
 - **Workers**: Configurable (default: 4)
-- **Rate Limits**: 100 req/min API, 5 req/min chat
+- **Rate Limits**: 300 req/min per client (global)
 - **Session Limits**: 100 sessions/user, 1000 messages/session
 - **Memory**: Automatic cleanup, configurable TTL
 
@@ -118,14 +118,14 @@ gunicorn --bind 0.0.0.0:8000 --workers 4 --worker-class uvicorn.workers.UvicornW
 ENVIRONMENT=production
 DEBUG=false
 CORS_ORIGINS=https://yourdomain.com
-RATE_LIMIT_REQUESTS=100
+RATE_LIMIT_REQUESTS=300
 SESSION_TTL=604800
 ```
 
 ### **High-Traffic Setup**
 ```env
 WORKERS=8
-RATE_LIMIT_REQUESTS=200
+RATE_LIMIT_REQUESTS=500
 SESSION_CLEANUP_INTERVAL=1800
 ```
 

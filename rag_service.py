@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 import logging
 import structlog
+import time
 
 # Document processing
 import PyPDF2
@@ -150,7 +151,7 @@ class RAGService:
                 "chunks": chunks,
                 "chunk_count": len(chunks),
                 "total_length": len(text),
-                "uploaded_at": asyncio.get_event_loop().time()
+                "uploaded_at": time.time()
             }
             
             # Generate embeddings for chunks

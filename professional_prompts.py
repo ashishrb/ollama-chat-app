@@ -1,5 +1,8 @@
 # professional_prompts.py - Optimized System Prompts for Speed and Quality
 
+import os
+
+
 class SystemPrompts:
     """Collection of optimized system prompts for different use cases"""
     
@@ -12,7 +15,7 @@ class SystemPrompts:
     
     # CODING: Optimized for programming tasks
     CODING = ("You are a coding assistant. Provide complete, working code with brief explanations. "
-             "Use ```language blocks for code. No verbose explanations.")
+             "Use ```language``` blocks for code. No verbose explanations.")
     
     # RAG: Optimized for document-based queries
     RAG = ("Answer questions using only the provided context. "

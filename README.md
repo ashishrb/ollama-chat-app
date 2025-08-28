@@ -20,7 +20,7 @@ A high-performance, scalable chat application powered by Ollama with advanced RA
 ### 🚀 Performance & Scalability
 - **Intelligent Caching**: LRU cache with configurable TTL for lightning-fast responses
 - **Async Architecture**: Non-blocking operations with aiofiles and async processing
-- **Rate Limiting**: Configurable per-endpoint rate limits (300 req/min default)
+- **Rate Limiting**: Configurable global rate limit per client (300 req/min default)
 - **Session Management**: TTL-based cleanup with configurable limits
 - **Background Tasks**: Automatic cleanup and maintenance
 

@@ -1101,25 +1101,32 @@
                     }
                 } else {
                     // Regular chat
+                    const requestBody = {
+                        message: message,
+                        model: selectedModel,
+                        temperature: 0.2
+                    };
+
+                    if (currentSessionId) {
+                        requestBody.session_id = currentSessionId;
+                    }
+
                     response = await fetch('/api/chat', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
                         },
-                        body: JSON.stringify({
-                            message: message,
-                            model: selectedModel,
-                            temperature: 0.2
-                        })
+                        body: JSON.stringify(requestBody)
                     });
-                    
+
                     if (response.ok) {
                         const data = await response.json();
                         addMessage('assistant', data.response);
-                        
-                        if (!currentSessionId) {
-                            currentSessionId = data.session_id;
-                            document.getElementById('chatTitle').textContent = 'Chat Session';
+
+                        currentSessionId = data.session_id;
+                        const chatTitleEl = document.getElementById('chatTitle');
+                        if (!chatTitleEl.textContent || chatTitleEl.textContent === 'New Chat') {
+                            chatTitleEl.textContent = 'Chat Session';
                         }
                     } else {
                         const error = await response.json();

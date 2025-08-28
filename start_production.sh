@@ -90,7 +90,7 @@ start_app() {
     fi
     
     # Check if requirements are installed
-    if ! source "$VENV_DIR/bin/activate" && python -c "import fastapi, uvicorn, ollama" 2>/dev/null; then
+    if ! ( source "$VENV_DIR/bin/activate" && python -c "import fastapi, uvicorn, ollama" >/dev/null 2>&1 ); then
         error "Required packages not installed. Installing requirements..."
         source "$VENV_DIR/bin/activate"
         pip install -r requirements.txt
