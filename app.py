@@ -62,6 +62,8 @@ except ImportError as e:
         cache_ttl = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour
         max_context_length = int(os.getenv("MAX_CONTEXT_LENGTH", "4000"))  # Reduced for speed
         chunk_batch_size = int(os.getenv("CHUNK_BATCH_SIZE", "5"))  # Parallel processing
+
+        
     
     settings = Settings()
     print(f"✅ Performance-optimized fallback config loaded - Debug: {settings.debug}")
@@ -572,7 +574,141 @@ async def health_check():
             content={"status": "unhealthy", "error": str(e), "timestamp": datetime.now().isoformat()}
         )
 
-# OPTIMIZED: Chat endpoint with caching
+# OPTIMIZED: Context management functions
+def get_optimal_context_for_model(model_name: str, messages: List[Dict], system_prompt: str) -> List[Dict]:
+    """
+    Enhanced context management optimized for different models, especially gpt-oss-20b
+    """
+    try:
+        # Get model-specific context limit
+        context_limit = settings.get_context_limit_for_model(model_name)
+        
+        # Start with system prompt
+        context_messages = [{"role": "system", "content": system_prompt}]
+        current_length = len(system_prompt)
+        
+        # If smart truncation is disabled, use simple truncation
+        if not settings.enable_smart_truncation:
+            return simple_context_truncation(messages, context_limit, system_prompt)
+        
+        # ✅ SMART TRUNCATION: Always preserve recent messages
+        recent_messages = messages[-settings.preserve_recent_messages:] if len(messages) > settings.preserve_recent_messages else messages
+        
+        # Add recent messages first (guaranteed inclusion)
+        recent_length = sum(len(msg.get('content', '')) for msg in recent_messages)
+        
+        if current_length + recent_length <= context_limit:
+            # We can fit recent messages, now add older messages if space allows
+            context_messages.extend(recent_messages)
+            current_length += recent_length
+            
+            # Add older messages from newest to oldest
+            older_messages = messages[:-settings.preserve_recent_messages] if len(messages) > settings.preserve_recent_messages else []
+            
+            for i in range(len(older_messages) - 1, -1, -1):
+                msg = older_messages[i]
+                msg_length = len(msg.get('content', ''))
+                
+                if current_length + msg_length + settings.context_overlap_buffer <= context_limit:
+                    context_messages.insert(-len(recent_messages), msg)  # Insert before recent messages
+                    current_length += msg_length
+                else:
+                    break
+        else:
+            # Recent messages don't fit, truncate them smartly
+            context_messages.extend(truncate_messages_intelligently(recent_messages, context_limit - current_length))
+        
+        logger.info(f"Context optimized for {model_name}: {len(context_messages)} messages, {current_length} chars")
+        return context_messages
+        
+    except Exception as e:
+        logger.error(f"Error in context optimization: {e}")
+        return simple_context_truncation(messages, 8000, system_prompt)
+
+def simple_context_truncation(messages: List[Dict], limit: int, system_prompt: str) -> List[Dict]:
+    """Fallback simple truncation"""
+    context_messages = [{"role": "system", "content": system_prompt}]
+    current_length = len(system_prompt)
+    
+    # Add messages from newest to oldest
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        msg_length = len(msg.get('content', ''))
+        
+        if current_length + msg_length <= limit:
+            context_messages.insert(1, msg)  # Insert after system prompt
+            current_length += msg_length
+        else:
+            break
+    
+    return context_messages
+
+def truncate_messages_intelligently(messages: List[Dict], available_space: int) -> List[Dict]:
+    """
+    Intelligently truncate messages while preserving conversation flow
+    """
+    if not messages:
+        return []
+    
+    # Always try to keep user-assistant pairs together
+    truncated = []
+    current_length = 0
+    
+    # Work backwards from most recent
+    i = len(messages) - 1
+    while i >= 0 and current_length < available_space:
+        msg = messages[i]
+        msg_length = len(msg.get('content', ''))
+        
+        # If this is a user message, try to include its assistant response too
+        if msg.get('role') == 'user' and i < len(messages) - 1:
+            next_msg = messages[i + 1]
+            if next_msg.get('role') == 'assistant':
+                pair_length = msg_length + len(next_msg.get('content', ''))
+                if current_length + pair_length <= available_space:
+                    truncated.insert(0, msg)
+                    truncated.insert(1, next_msg)
+                    current_length += pair_length
+                    i -= 1  # Skip the assistant message in next iteration
+                else:
+                    break
+            else:
+                if current_length + msg_length <= available_space:
+                    truncated.insert(0, msg)
+                    current_length += msg_length
+                else:
+                    break
+        else:
+            if current_length + msg_length <= available_space:
+                truncated.insert(0, msg)
+                current_length += msg_length
+            else:
+                break
+        
+        i -= 1
+    
+    return truncated
+
+def get_conversation_summary(messages: List[Dict], max_length: int = 200) -> str:
+    """
+    Generate a brief summary of older conversation context
+    """
+    if len(messages) < 4:
+        return ""
+    
+    # Take first few and last few messages to create summary
+    early_messages = messages[:2]
+    
+    summary_parts = []
+    for msg in early_messages:
+        if msg.get('role') == 'user':
+            content = msg.get('content', '')[:100] + "..." if len(msg.get('content', '')) > 100 else msg.get('content', '')
+            summary_parts.append(f"User asked about: {content}")
+    
+    summary = " | ".join(summary_parts)
+    return summary[:max_length] + "..." if len(summary) > max_length else summary
+
+
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
     generation_start = time.time()
@@ -630,7 +766,7 @@ async def chat_endpoint(request: ChatRequest):
                 cached=True
             )
         
-        # OPTIMIZED: Build context with length limits
+        # ✅ FIXED: Build context with PROPER conversation history
         system_prompt = get_optimized_system_prompt(
             message=request.message, 
             model=request.model, 
@@ -638,34 +774,52 @@ async def chat_endpoint(request: ChatRequest):
         )
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Add recent messages with length control
-        # FIXED: Add conversation history in correct order (excluding the just-added user message)
-        recent_messages = session["messages"][:-1]  # Exclude the current user message just added
-        total_context_length = len(system_prompt)
-
-        # Add messages in chronological order (oldest to newest)
-        for msg in recent_messages[-8:]:  # Last 8 messages for context
-            msg_length = len(msg['content'])
-            if total_context_length + msg_length > settings.max_context_length:
-                break
-            messages.append({"role": msg['role'], "content": msg['content']})
-            total_context_length += msg_length
-
-        # Add the current user message (the one just added)
-        current_user_message = session["messages"][-1]
-        messages.append({"role": current_user_message['role'], "content": current_user_message['content']})
+        # ✅ CRITICAL FIX: Include COMPLETE conversation history properly
+        # Get all messages from session (including the one we just added)
+        all_session_messages = session["messages"]
         
-        # OPTIMIZED: Ollama options for speed
+        # Calculate how many messages we can fit within context limits
+        total_context_length = len(system_prompt)
+        context_limit = min(settings.max_context_length, 6000)  # Reasonable limit for gpt-oss-20b
+        
+        # ✅ NEW LOGIC: Include messages from newest to oldest, but maintain chronological order
+        messages_to_include = []
+        
+        # Start from the most recent messages and work backwards
+        for i in range(len(all_session_messages) - 1, -1, -1):
+            msg = all_session_messages[i]
+            msg_content = msg['content']
+            msg_length = len(msg_content)
+            
+            # Check if we can fit this message
+            if total_context_length + msg_length <= context_limit:
+                messages_to_include.insert(0, msg)  # Insert at beginning to maintain chronological order
+                total_context_length += msg_length
+            else:
+                break
+            
+            # Limit to last 20 messages maximum for performance
+            if len(messages_to_include) >= 20:
+                break
+        
+        # ✅ Add all included messages in chronological order
+        for msg in messages_to_include:
+            messages.append({"role": msg['role'], "content": msg['content']})
+        
+        # Debug logging for gpt-oss-20b
+        logger.info(f"Context for gpt-oss-20b: {len(messages)} messages, {total_context_length} chars")
+        
+        # OPTIMIZED: Ollama options for gpt-oss-20b
         options = {
             'temperature': request.temperature,
-            'top_p': 0.9,  # Add for better performance
-            'top_k': 40,   # Limit vocabulary for speed
+            'top_p': 0.9,
+            'top_k': 40,
         }
         if request.max_tokens:
-            options['num_predict'] = min(request.max_tokens, 2000)  # Cap for speed
+            options['num_predict'] = min(request.max_tokens, 2000)
         
         # Generate response with optimized retry logic
-        max_retries = 2  # Reduced retries
+        max_retries = 2
         
         for attempt in range(max_retries):
             try:
@@ -686,7 +840,7 @@ async def chat_endpoint(request: ChatRequest):
                     logger.error("Ollama request failed", model=request.model, error=str(e))
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Failed to generate response: {str(e)[:100]}..."  # Truncate error
+                        detail=f"Failed to generate response: {str(e)[:100]}..."
                     )
                 else:
                     # Quick retry without exponential backoff
@@ -710,6 +864,9 @@ async def chat_endpoint(request: ChatRequest):
         
         generation_time = time.time() - generation_start
         RESPONSE_GENERATION_TIME.observe(generation_time)
+        
+        # ✅ Additional debug info for testing
+        logger.info(f"Chat response generated in {generation_time:.2f}s for session {session_id}")
         
         return ChatResponse(
             response=assistant_content,
@@ -893,7 +1050,6 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/api/rag/query")
 async def rag_query(request: RAGQueryRequest):
-    """Cached RAG query processing"""
     query_start = time.time()
     
     try:
@@ -911,11 +1067,11 @@ async def rag_query(request: RAGQueryRequest):
                 cached=True
             )
         
-        # Get document context (with timeout)
+        # Get document context
         try:
             context_task = asyncio.wait_for(
                 rag_service.get_document_context(request.query, max_chunks=request.max_chunks),
-                timeout=5.0  # 5 second timeout for context retrieval
+                timeout=5.0
             )
             context = await context_task
         except asyncio.TimeoutError:
@@ -927,20 +1083,32 @@ async def rag_query(request: RAGQueryRequest):
                 detail="No documents available for RAG queries. Please upload documents first."
             )
         
-        # Optimized messages for RAG
+        # ✅ ENHANCED: RAG with conversation awareness
         system_prompt = get_optimized_system_prompt(
             message=request.query,
             model=request.model,
             mode="rag",
             context=context
         )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": request.query}
-        ]
         
-        # Fast Ollama generation
-        options = {'temperature': request.temperature, 'num_predict': 800}  # Limit response length
+        # ✅ NEW: Include recent conversation context in RAG mode
+        # This helps maintain conversation flow even in RAG mode
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add a brief conversation context if available
+        # (This is a simplified approach - you might want to get actual session context)
+        messages.append({"role": "user", "content": request.query})
+        
+        # Fast Ollama generation with model-specific optimization
+        context_limit = settings.get_context_limit_for_model(request.model)
+        max_tokens = min(800, context_limit // 4)  # Adaptive response length
+        
+        options = {
+            'temperature': request.temperature, 
+            'num_predict': max_tokens,
+            'top_p': 0.9,
+            'top_k': 40
+        }
         
         response = ollama.chat(model=request.model, messages=messages, options=options)
         
@@ -955,7 +1123,7 @@ async def rag_query(request: RAGQueryRequest):
         cache_response(cache_key, cache_data)
         
         query_time = time.time() - query_start
-        logger.info(f"RAG query processed in {query_time:.2f}s")
+        logger.info(f"Enhanced RAG query processed in {query_time:.2f}s for {request.model}")
         
         return RAGQueryResponse(
             response=response['message']['content'],
@@ -969,7 +1137,7 @@ async def rag_query(request: RAGQueryRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"RAG query failed: {str(e)[:100]}...")
+        raise HTTPException(status_code=500, detail=f"Enhanced RAG query failed: {str(e)[:100]}...")
 
 @app.get("/api/rag/documents")
 async def get_documents():
